@@ -1,0 +1,14 @@
+FrameworkConfig_RememberMenuState=true
+FrameworkConfig_MenuOpen=false
+Frontend_RequestedRuntime=openxr_loader.dll
+VR_AimMethod=0
+VR_AimModifyPlayerControlRotation=false
+VR_AimUsePawnControlRotation=false
+VR_DecoupledPitch=true
+VR_EnableCustomZNear=true
+VR_CustomZNear=1.000000
+VR_SnapTurn=false
+VR_RoomscaleMovement=false
+VR_MovementOrientation=0
+VR_WorldScale=1.000000
+VR_UseFMallocSceneViewExtensions=true

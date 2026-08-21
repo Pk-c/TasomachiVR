@@ -1,0 +1,20 @@
+# Build output
+build/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Content extracted from the game: property of Orbital Express / Nayuta Studio,
+# and must never be published. These files exist only for local analysis.
+extracted/
+tools/pak_list.txt
+
+# Development artefacts
+*.log
+# UEVR session logs kept aside for diagnosis: they are captures of someone's play
+# session, not source, and UEVR truncates its own log on every launch.
+logs/
+payload/profile/plugins/
+dist/
