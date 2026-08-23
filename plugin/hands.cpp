@@ -110,12 +110,6 @@ Vector rotate_yaw(const Vector& v, float degrees) {
     return Vector{v.x * c - v.y * s, v.x * s + v.y * c, v.z};
 }
 
-float distance(const Vector& a, const Vector& b) {
-    const float dx = a.x - b.x;
-    const float dy = a.y - b.y;
-    const float dz = a.z - b.z;
-    return std::sqrt(dx * dx + dy * dy + dz * dz);
-}
 
 } // namespace
 
@@ -140,32 +134,8 @@ bool Hands::attach(API::UObject* component, uint32_t hand) {
 // The controller relative to the headset, in UE world space: the delta is taken in
 // tracking space (so the play-space origin cancels out), converted, then turned by the
 // head's world yaw. Added to the head bone, that lands where the hand should be.
-bool Hands::computed(bool right, float head_yaw, const Vec3& head, Vec3& out,
-                     Vec3& raw) const {
-    const auto* vr = API::get()->param()->vr;
-    if (vr == nullptr) {
-        return false;
-    }
 
-    const auto hmd = vr->get_hmd_index();
-    const auto hand = right ? vr->get_right_controller_index() : vr->get_left_controller_index();
-
-    UEVR_Vector3f hmd_pos{};
-    UEVR_Vector3f hand_pos{};
-    UEVR_Quaternionf ignored{};
-    vr->get_pose(hmd, &hmd_pos, &ignored);
-    vr->get_pose(hand, &hand_pos, &ignored);
-
-    const UEVR_Vector3f delta{hand_pos.x - hmd_pos.x, hand_pos.y - hmd_pos.y,
-                              hand_pos.z - hmd_pos.z};
-    raw = Vector{delta.x, delta.y, delta.z};
-
-    const Vector local = rotate_yaw(vr_to_ue(delta), head_yaw);
-    out = Vector{head.x + local.x, head.y + local.y, head.z + local.z};
-    return true;
-}
-
-bool Hands::update(API::UObject* pawn, bool log, float head_yaw) {
+bool Hands::update(API::UObject* pawn, float head_yaw) {
     if (pawn == nullptr) {
         return false;
     }
@@ -217,39 +187,6 @@ bool Hands::update(API::UObject* pawn, bool log, float head_yaw) {
     component_rotation(m_left, m_left_rot);
     component_rotation(m_right, m_right_rot);
     m_tracked = have_left && have_right;
-
-    if (!log || ++m_log_age < 60) {
-        return true;
-    }
-    m_log_age = 0;
-
-    // Distance to the head bone is the sanity check: a hand held out should read 30-80 cm.
-    // A constant distance means the component is not being driven at all.
-    API::get()->log_info(
-        "[TasomachiVR] HANDS | hooked L=(%.0f %.0f %.0f)%s R=(%.0f %.0f %.0f)%s "
-        "head=(%.0f %.0f %.0f)%s | dL=%.0f dR=%.0f",
-        left.x, left.y, left.z, have_left ? "" : "?", right.x, right.y, right.z,
-        have_right ? "" : "?", head.x, head.y, head.z, have_head ? "" : "?",
-        have_left && have_head ? distance(left, head) : -1.0f,
-        have_right && have_head ? distance(right, head) : -1.0f);
-
-    // The computed route, logged next to it. The raw tracking-space delta is what says
-    // how to fix the axis mapping if the result is wrong: hold one hand straight out to
-    // the side and see which raw component carries the movement.
-    Vector computed_left{};
-    Vector computed_right{};
-    Vector raw_left{};
-    Vector raw_right{};
-    if (have_head && computed(false, head_yaw, head, computed_left, raw_left) &&
-        computed(true, head_yaw, head, computed_right, raw_right)) {
-        API::get()->log_info(
-            "[TasomachiVR] HANDS | computed L=(%.0f %.0f %.0f) R=(%.0f %.0f %.0f) "
-            "| dL=%.0f dR=%.0f | raw L=(%.2f %.2f %.2f) R=(%.2f %.2f %.2f) yaw=%.0f",
-            computed_left.x, computed_left.y, computed_left.z, computed_right.x,
-            computed_right.y, computed_right.z, distance(computed_left, head),
-            distance(computed_right, head), raw_left.x, raw_left.y, raw_left.z,
-            raw_right.x, raw_right.y, raw_right.z, head_yaw);
-    }
 
     return true;
 }

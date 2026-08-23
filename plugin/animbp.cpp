@@ -239,53 +239,6 @@ bool AnimBp::ensure_class() {
     return true;
 }
 
-// Retired, and deliberately left as a no-op rather than deleted so the reason survives.
-//
-// This used to resolve the mesh by path and assign the class before gameplay, to win a race
-// against the engine's own InitAnim. It was not needed - the session logs from when the arms
-// worked show the assignment landing on the first gameplay tick and the instance appearing
-// three milliseconds later, unaided - and it did active harm twice over. It dereferenced a
-// by-path pointer every frame, which became an access violation the moment a level load
-// collected the asset and silently killed the rest of the pre-tick. And by calling
-// ensure_class() from the menu map it loaded the Blueprint in a context where its CDO could
-// not be built, permanently poisoning the cached class.
-//
-// The assignment now happens in ensure_assigned, during gameplay, on the asset read straight
-// off the live component. That is what worked before, and it is the only place that can know
-// the correct target anyway.
-void AnimBp::prepare() {
-    return;
-#if 0
-    // Latched, and this matters far more than it looks. This used to run every single
-    // frame: find the asset by path, dereference it, notice the slot already held the
-    // class, return. That is fine right up until a level load collects the asset, after
-    // which find_uobject hands back a pointer to freed memory and the dereference is an
-    // access violation - 0xC0000005, every frame, swallowed by the host. The game kept
-    // running and the pre-tick did not: the pause-menu graft, the hands and the anim
-    // Blueprint update all live after this line and were silently skipped for the whole
-    // session.
-    //
-    // Nothing is lost by stopping. This pass only exists to win a race against the
-    // engine's own InitAnim at startup; from then on ensure_assigned writes to the asset
-    // the live component actually holds, which is both the correct target and a pointer
-    // that cannot be stale because it was just read off the component.
-    if (m_prepared || !ensure_class()) {
-        return;
-    }
-    // By path, because at this point there may be no pawn to ask.
-    auto* asset = API::get()->find_uobject<API::UObject>(
-        L"SkeletalMesh /Game/chr/PC/SK_Pc_01.SK_Pc_01");
-    if (asset == nullptr) {
-        return;
-    }
-    m_prepared = true;
-    // Best-effort, and no longer the only write: see write_slot and ensure_assigned. If
-    // this one lands before the character spawns the engine's own InitAnim picks the
-    // Blueprint up and nothing further is needed.
-    write_slot(asset);
-#endif
-}
-
 // GUARDED. An earlier version wrote unconditionally and a later read came back holding a
 // MATERIAL - M_Bg_w_costume06 - so the write is conditional on the read making sense: the
 // only states worth writing over are "empty" and "already ours". Anything else means the
@@ -328,275 +281,54 @@ bool AnimBp::ensure_assigned(API::UObject* mesh) {
         return false;
     }
 
-    // THE asset the component is actually using, which is not necessarily the one prepare()
-    // found. prepare() resolves /Game/chr/PC/SK_Pc_01 by path and writes there once; this
-    // game swaps the character's mesh for costumes, so the component can perfectly well be
-    // pointing somewhere else by the time anyone looks. That is the whole bug: the write
-    // landed in one USkeletalMesh and InitializeAnimScriptInstance read PostProcessAnimBlueprint
-    // off another, found it null, and set PostProcessAnimInstance to null every single time.
+    // The property lives on the mesh ASSET, not on the component, so one write covers every
+    // component using it. It has to be the asset read off the LIVE component rather than one
+    // resolved by path: a level load replaces the object, and writing to the stale one is
+    // both useless and, once it has been collected, a crash.
     //
-    // Re-checked whenever the asset changes rather than latched, so a costume swap is
-    // covered too.
+    // Nothing else is needed. The engine builds the instance during its own InitAnim, which
+    // it runs a few milliseconds after this lands - measured at 3 ms in the first working
+    // session and 4 ms in the one that fixed it. Every attempt to force that rebuild by hand
+    // was chasing a failure that was really the class having no CDO, and all of it is gone.
     if (asset != m_asset) {
         m_asset = asset;
-        m_reinit_attempts = 0;
-        m_reinit_wait = 90;
         API::get()->log_info("[TasomachiVR] ANIMBP | live asset is %s (write %s)",
                              uc::object_name(asset).c_str(),
                              write_slot(asset) ? "ok" : "FAILED");
     }
-
-    // The assignment itself is prepare()'s job and is guarded there. What is left here is
-    // making the engine notice it.
-    //
-    // Assigning PostProcessAnimBlueprint after the component has already run InitAnim does
-    // nothing on its own: the instance is built during initialisation and never revisited.
-    // So a rebuild has to be provoked, and the choice of lever matters:
-    //
-    //   SetSkeletalMesh(sameMesh)   early-outs, so the version of this that "issued a
-    //                               re-init" for twelve attempts was calling a no-op.
-    //   SetSkeletalMesh(nullptr)    defeats the early-out and is far too violent - it
-    //                               strips a live character's mesh, and that is what sent
-    //                               the arms flying in every direction.
-    //   SetAnimationMode(other)     early-outs on the same value too, but TOGGLING it does
-    //                               a genuine ClearAnimScriptInstance + re-initialise and
-    //                               never touches the mesh. It is also exactly the
-    //                               transition the game itself performs every time it calls
-    //                               PlayAnimation for an interaction, so the character
-    //                               demonstrably survives it.
-    //
-    // Spaced out and attempted a handful of times, because it is still a rebuild.
-    if (--m_reinit_wait > 0) {
-        return true;
-    }
-    m_reinit_wait = 90;
-
-    if (++m_reinit_attempts > 6) {
-        return true;
-    }
-
-    // Two different ways to make the engine run InitializeAnimScriptInstance(true), because
-    // the first one demonstrably is not enough on this build.
-    //
-    // SetAllowRigidBodyAnimNode is the better lever and it is tried first. Reading 4.25:
-    //
-    //   if (bDisableRigidBodyAnimNode == bInAllow) {
-    //       bDisableRigidBodyAnimNode = !bInAllow;
-    //       if (bReinitAnim && bRegistered && SkeletalMesh) InitializeAnimScriptInstance(true);
-    //   }
-    //
-    // It flips a flag nothing else in this game touches, never goes near the mesh, and -
-    // the part that matters - it tests bRegistered itself. InitializeAnimScriptInstance
-    // does nothing at all unless the component is registered, and that is the one condition
-    // in the whole chain I have not been able to observe from outside. Calling it twice
-    // leaves the flag exactly as it was found and re-initialises on each call.
-    const char* lever = "rigidbody";
-    bool away = false;
-    bool back = false;
-
-    // The one measurement that separates the two remaining explanations. Every condition
-    // NeedToSpawnPostPhysicsInstance tests now reads correct, so either the engine ran the
-    // initialisation and refused anyway - which the 4.25 source says is impossible - or it
-    // never ran it. InitializeAnimScriptInstance always builds a BRAND NEW main instance,
-    // so comparing the pointer across the call answers it outright:
-    //   pointer changed  -> the engine really did re-initialise, and the refusal is real
-    //   pointer the same -> the call never reached the engine, or IsRegistered() is false,
-    //                       and no amount of tuning this lever will ever help
-    auto* main_before = uc::property_object(mesh, L"AnimScriptInstance");
-
-    // Attempt 3 onwards: stop asking the engine to build the instance and build it here.
-    //
-    // Every condition NeedToSpawnPostPhysicsInstance tests has now been measured and every
-    // one of them is satisfied - the class sits at +752 exactly where the reflection probe
-    // said, it differs from AnimClass, and the main instance is provably rebuilt, so
-    // IsRegistered() is true and the engine really is executing the surrounding lines. It
-    // still does not call NewObject. That cannot be reconciled with the 4.25 source, so it
-    // is not worth any more rounds of trying to persuade it.
-    //
-    // spawn_object is the engine's own NewObject, and the component is the right outer. The
-    // instance is then written into PostProcessAnimInstance directly, and the animation-mode
-    // toggle - the one lever proven to reach the engine - runs immediately afterwards so the
-    // tail of InitializeAnimScriptInstance initialises it for us:
-    //
-    //   if (PostProcessAnimInstance && !bInitializedPostInstance && bForceReinit)
-    //       PostProcessAnimInstance->InitializeAnimation();
-    //
-    // This is also the last diagnostic worth running. If our instance survives that toggle,
-    // the engine sees a non-null class in the slot and the arms should come back. If the
-    // engine nulls it, that is proof it reads a different USkeletalMesh than the one this
-    // code writes to, and the search moves to finding which.
-    if (m_reinit_attempts >= 3) {
-        lever = "spawned";
-        if (m_spawned == nullptr) {
-            m_spawned = API::get()->spawn_object(m_class, mesh);
-
-            // A CONTROL, because "FAILED" on its own proves nothing. spawn_object returning
-            // null can mean our class cannot be instantiated - or that this API simply does
-            // not work for anim instances on this build, in which case the result says
-            // nothing whatever about ABP_VRArms and concluding from it would be the same
-            // mistake as every other one today.
-            //
-            // So the same call is made with the game's own anim Blueprint, which the engine
-            // demonstrably instantiates several times a second:
-            //   control ok, ours FAILED -> the class really is the problem, and it is a cook
-            //                              issue: this exact code path worked with the pak
-            //                              built before Combine Rotators was added.
-            //   both FAILED             -> spawn_object is unusable here and tells us nothing.
-            API::UObject* control = nullptr;
-            if (auto** ac = mesh->get_property_data<API::UClass*>(L"AnimClass")) {
-                if (*ac != nullptr) {
-                    control = API::get()->spawn_object(*ac, mesh);
-                }
-            }
-
-            // And whether the class default object is actually resident. NewObject needs it;
-            // a class loaded without its CDO is exactly the shape of failure we are seeing.
-            auto* cdo = API::get()->find_uobject<API::UObject>(
-                L"ABP_VRArms_C /Game/TasomachiVR/ABP_VRArms.Default__ABP_VRArms_C");
-
-            API::get()->log_info("[TasomachiVR] ANIMBP | spawn ours=%s | control(%s)=%s | "
-                                 "our CDO %s",
-                                 m_spawned != nullptr
-                                     ? uc::class_name(m_spawned).c_str() : "FAILED",
-                                 "game AnimClass",
-                                 control != nullptr
-                                     ? uc::class_name(control).c_str() : "FAILED",
-                                 cdo != nullptr ? "is resident" : "IS MISSING");
-        }
-        if (m_spawned != nullptr) {
-            if (auto** hold = mesh->get_property_data<API::UObject*>(
-                    L"PostProcessAnimInstance")) {
-                *hold = m_spawned;
-            }
-        }
-        auto* mode2 = mesh->get_property_data<uint8_t>(L"AnimationMode");
-        const uint8_t cur2 = mode2 != nullptr ? *mode2 : 0;
-        away = uc::call_one(mesh, L"SetAnimationMode", (uint8_t)(cur2 == 0 ? 1 : 0));
-        back = uc::call_one(mesh, L"SetAnimationMode", cur2);
-    } else if (m_reinit_attempts <= 2) {
-        uc::Call a{mesh, L"SetAllowRigidBodyAnimNode"};
-        if (a.ok && uc::put(a, 0, false) && uc::put(a, 1, true)) {
-            mesh->process_event(a.fn, a.bytes.data());
-            away = true;
-        }
-        uc::Call b{mesh, L"SetAllowRigidBodyAnimNode"};
-        if (b.ok && uc::put(b, 0, true) && uc::put(b, 1, true)) {
-            mesh->process_event(b.fn, b.bytes.data());
-            back = true;
-        }
-    } else {
-        // Fallback: the animation-mode toggle. TEnumAsByte<EAnimationMode::Type> is a whole
-        // byte and not a bitfield, so reading it is safe. 0 = AnimationBlueprint,
-        // 1 = AnimationSingleNode, 2 = AnimationCustomMode.
-        lever = "animmode";
-        auto* mode = mesh->get_property_data<uint8_t>(L"AnimationMode");
-        const uint8_t current_mode = mode != nullptr ? *mode : 0;
-        const uint8_t other_mode = current_mode == 0 ? 1 : 0;
-        away = uc::call_one(mesh, L"SetAnimationMode", other_mode);
-        back = uc::call_one(mesh, L"SetAnimationMode", current_mode);
-    }
-
-    // Reported alongside the toggle because these three are exactly the conditions
-    // NeedToSpawnPostPhysicsInstance tests, read straight out of the 4.25 source:
-    //   ClassToUse = *SkeletalMesh->PostProcessAnimBlueprint  must be non-null
-    //   MainInstanceClass = *AnimClass                        must differ from it
-    // If a toggle logs slot=ok and still no instance appears, one of those is the answer
-    // and there is no need to guess a third time.
-    // Everything InitializeAnimScriptInstance touches, read back straight after the toggle.
-    // The slot reads "ok" and no instance appears, so the remaining question is whether the
-    // engine ran the initialisation at all:
-    //
-    //   main rebuilt, post null  -> it ran and NeedToSpawnPostPhysicsInstance said no, which
-    //                               given a non-null ClassToUse can only mean AnimClass IS
-    //                               our class, or the component reads a different asset
-    //   main also null           -> it never ran: IsRegistered() was false, or SetAnimationMode
-    //                               did not do what the 4.25 source says it does
-    auto** check = asset->get_property_data<API::UClass*>(L"PostProcessAnimBlueprint");
-    void* slot_addr = (void*)check;
-    auto* main_inst = uc::property_object(mesh, L"AnimScriptInstance");
-    auto* post_inst = uc::property_object(mesh, L"PostProcessAnimInstance");
-
-    // The last ambiguity in the read path, and it has been there from the beginning:
-    // property_object returns nullptr both when the instance really is null AND when the
-    // property cannot be resolved at all. Those two mean opposite things - one says the
-    // engine refused to build it, the other says I have been blind the whole time and the
-    // arms may well have been created and simply never driven. The raw slot address tells
-    // them apart: null = no such property.
-    //
-    // The offset is checked at the same time. The reflection probe reported
-    // PostProcessAnimBlueprint at +752 on /Script/Engine.SkeletalMesh; if what I am writing
-    // through does not sit exactly there, then reflection is resolving something else and
-    // that alone explains why the engine reads a slot I am not writing to.
-    auto** ppai = mesh->get_property_data<API::UObject*>(L"PostProcessAnimInstance");
-    const long long slot_offset = (slot_addr != nullptr && asset != nullptr)
-        ? (long long)((char*)slot_addr - (char*)asset) : -1;
-    auto** anim_class = mesh->get_property_data<API::UClass*>(L"AnimClass");
-
-    API::get()->log_info("[TasomachiVR] ANIMBP | rebuild via %s (attempt %d, calls %d/%d) "
-                         "| main %p -> %p %s | asset=%s slot=%s@+%lld ppai_slot=%p "
-                         "| AnimClass=%s main=%s post=%s",
-                         lever, m_reinit_attempts, (int)away, (int)back,
-                         (void*)main_before, (void*)main_inst,
-                         main_before != main_inst ? "REBUILT" : "untouched",
-                         uc::object_name(asset).c_str(),
-                         (check != nullptr && *check == m_class) ? "ok"
-                             : (check != nullptr && *check != nullptr) ? "other" : "EMPTY",
-                         slot_offset, (void*)ppai,
-                         (anim_class != nullptr && *anim_class != nullptr)
-                             ? uc::narrow((*anim_class)->get_fname()->to_string()).c_str()
-                             : "none",
-                         main_inst != nullptr ? uc::class_name(main_inst).c_str() : "null",
-                         post_inst != nullptr ? uc::class_name(post_inst).c_str() : "null");
-
     return true;
-#if 0
+}
 
-    // bDisablePostProcessBlueprint would stop InitAnim building the instance at all, so
-    // it is worth clearing - but ONLY through the setter.
-    //
-    // It is declared "uint8 bDisablePostProcessBlueprint : 1", a BITFIELD. Reading it
-    // through get_property_data<bool> reads the whole byte, which holds several unrelated
-    // flags, and writing a bool back wipes them. That is precisely what broke this: the
-    // instance had been created reliably until a previous version of this function
-    // "cleared" a flag that was never set, and clobbered its neighbours in the process.
-    //
-    // The SDK exposes no bit mask, so the rule is simple: never write a bitfield property
-    // by hand. Use the reflected setter, and if there is none, leave it alone.
-    uc::call_one(mesh, L"SetDisablePostProcessBlueprint", false);
-
-    // Spaced out rather than every tick: this rebuilds the whole animation state.
-    if (--m_reinit_wait > 0) {
-        return true;
+// Asks the engine to rebuild its animation, because the assignment alone is a RACE.
+//
+// Writing the class into the mesh asset only takes effect the next time the component runs
+// InitAnim, and whether that happens right after the write is pure timing. It did in the two
+// sessions that worked - 3 ms and 4 ms later - and it did not in the next one, which is what
+// "the arms are back" and "you just broke the arms again" actually measured.
+//
+// SetAnimationMode toggled away and back calls InitializeAnimScriptInstance(true), which is
+// verified rather than assumed: the main anim instance comes back as a different object
+// afterwards. Nothing else is touched - in particular not the mesh, which is what made the
+// earlier SetSkeletalMesh(nullptr) attempt throw the arms around the room.
+//
+// This was deleted once as dead machinery, on the grounds that it had never been seen to
+// produce an instance. It never COULD: at the time the class had no CDO, so NewObject
+// returned null no matter who asked. Removing it took away the safety net the moment it
+// started being able to work.
+void AnimBp::nudge_rebuild(API::UObject* mesh) {
+    if (--m_wait > 0 || ++m_nudges > 5) {
+        return;
     }
-    m_reinit_wait = 90;
+    m_wait = 45;
 
-    if (++m_reinit_attempts > 6) {
-        return true;
-    }
-
-    // SetSkeletalMesh(sameMesh) EARLY-OUTS - USkinnedMeshComponent returns immediately
-    // when handed the mesh it already has. So the previous version of this, which called
-    // it with the current mesh and logged "re-init issued", never did anything at all.
-    // The two sessions where the arms worked had simply won a race: the assignment landed
-    // before the game's own InitAnim, and the engine picked it up by itself. Twelve
-    // repetitions of a no-op could not change that.
-    //
-    // Clearing the mesh first defeats the early-out and makes the second call rebuild for
-    // real. It costs one frame with no mesh, which is why it is attempted a handful of
-    // times and no more.
-    uc::Call clear{mesh, L"SetSkeletalMesh"};
-    if (clear.ok && uc::put(clear, 0, (API::UObject*)nullptr) && uc::put(clear, 1, true)) {
-        mesh->process_event(clear.fn, clear.bytes.data());
-    }
-
-    uc::Call restore{mesh, L"SetSkeletalMesh"};
-    if (restore.ok && uc::put(restore, 0, asset) && uc::put(restore, 1, true)) {
-        mesh->process_event(restore.fn, restore.bytes.data());
-        API::get()->log_info("[TasomachiVR] ANIMBP | forced re-init %d", m_reinit_attempts);
-    }
-
-    return true;
-#endif
+    // TEnumAsByte<EAnimationMode::Type>: a whole byte, not a bitfield, so reading it is
+    // safe. 0 = AnimationBlueprint, 1 = AnimationSingleNode.
+    auto* mode = mesh->get_property_data<uint8_t>(L"AnimationMode");
+    const uint8_t current = mode != nullptr ? *mode : 0;
+    uc::call_one(mesh, L"SetAnimationMode", (uint8_t)(current == 0 ? 1 : 0));
+    uc::call_one(mesh, L"SetAnimationMode", current);
+    API::get()->log_info("[TasomachiVR] ANIMBP | no instance yet - asked the engine to "
+                         "rebuild (%d)", m_nudges);
 }
 
 API::UObject* AnimBp::find_instance(API::UObject* mesh) {
@@ -646,11 +378,10 @@ void AnimBp::update(API::UObject* pawn, const Targets& targets, const Tuning& tu
         // assignment lives on the shared asset and does not.
         m_instance = nullptr;
         m_arm_length = 0.0f;
-        m_reinit_attempts = 0;
-        // Not zero: a fresh pawn gets a second and a half before anything is rebuilt, so a
-        // naturally-created instance is found first and the toggle below never fires. Only
-        // if none has appeared by then is it worth provoking one.
-        m_reinit_wait = 90;
+        // Half a second before the first nudge: the engine usually gets there on its own,
+        // and rebuilding when it was about to anyway is churn for nothing.
+        m_wait = 30;
+        m_nudges = 0;
     }
 
     if (m_mesh == nullptr || !ensure_class() || !ensure_assigned(m_mesh)) {
@@ -666,10 +397,12 @@ void AnimBp::update(API::UObject* pawn, const Targets& targets, const Tuning& tu
         auto* current = find_instance(m_mesh);
         if (current != m_instance) {
             if (current == nullptr) {
-                API::get()->log_info("[TasomachiVR] ANIMBP | instance went away - rebuilding");
+                // It comes back on its own: the game's next InitAnim rebuilds it, exactly
+                // as it built it the first time.
+                API::get()->log_info("[TasomachiVR] ANIMBP | instance went away");
                 m_instance = nullptr;
-                m_reinit_attempts = 0;
-                m_reinit_wait = 90;
+                m_wait = 30;
+                m_nudges = 0;
                 return;
             }
             API::get()->log_info("[TasomachiVR] ANIMBP | post-process instance is %s",
@@ -678,11 +411,8 @@ void AnimBp::update(API::UObject* pawn, const Targets& targets, const Tuning& tu
         }
     }
     if (m_instance == nullptr) {
+        nudge_rebuild(m_mesh);
         return;
-    }
-    {
-        // Nothing more to rebuild while it exists.
-        m_reinit_attempts = 99;
     }
 
     if (m_arm_length <= 0.0f) {
@@ -729,15 +459,19 @@ void AnimBp::update(API::UObject* pawn, const Targets& targets, const Tuning& tu
     const Vector right_off{tuning.right_hand_offset[0], tuning.right_hand_offset[1],
                            tuning.right_hand_offset[2]};
 
+    // ComposeRotators(A, B) returns FQuat(B) * FQuat(A) - A first, then B applied in the
+    // outer frame. The wrist correction is expressed in the CONTROLLER's own frame, so it
+    // has to be the inner term: FQuat(controller) * FQuat(offset), which is A=offset,
+    // B=controller.
+    //
+    // The other way round applies the correction in world space, and then the hands turn
+    // with the room instead of with your wrists - the correction looked right facing one
+    // way and wrong facing another. This was a live setting for a while, which only made it
+    // possible to be wrong in two directions; there is one correct order and this is it.
     Vector left_rot = left_raw;
     Vector right_rot = right_raw;
-    if (tuning.compose_order == 0) {
-        compose_rotators(left_raw, left_off, left_rot);
-        compose_rotators(right_raw, right_off, right_rot);
-    } else {
-        compose_rotators(left_off, left_raw, left_rot);
-        compose_rotators(right_off, right_raw, right_rot);
-    }
+    compose_rotators(left_off, left_raw, left_rot);
+    compose_rotators(right_off, right_raw, right_rot);
 
     write(m_instance, kVarLeftRot, left_rot);
     write(m_instance, kVarRightRot, right_rot);

@@ -2,7 +2,7 @@
 //
 // This logic used to live in the Lua script. It moved here because the wall test has to
 // happen in the same place as the eye is computed, and because C++ already owns the view
-// rotation, the body, the arms and the roomscale - the Lua half had shrunk to a liability.
+// rotation, the body and the arms - the Lua half had shrunk to a liability.
 //
 // Two things it does:
 //
@@ -15,15 +15,6 @@
 //   are damped away; a jump or a crouch exceeds the limit at once and is followed exactly.
 //   A plain low-pass cannot do both, and the clamp is what separates the two regimes.
 //
-//   KEEPS OUT OF WALLS. The roomscale move sweeps the capsule, so the body cannot walk
-//   through geometry - but nothing stops the player leaning their head through a
-//   partition. A sphere trace from the body to the wanted eye position finds the wall and
-//   the eye is held at it.
-//
-//   The wall distance is found by BISECTION rather than by reading the hit result:
-//   FHitResult is a large struct whose field offsets would have to be guessed, and this
-//   project has paid for enough guessed layouts. A blocked-or-not boolean is all the
-//   engine has to tell us, and six halvings put the eye within a centimetre.
 #pragma once
 
 #include <uevr/API.hpp>
@@ -40,16 +31,6 @@ public:
         float sway_damping{22.0f};
         // Centimetres. Past this the filter gives up and tracks the head exactly.
         float sway_limit{4.0f};
-
-        bool  collide{true};
-        // Radius of the sphere swept towards the eye. Roughly a head.
-        float probe_radius{12.0f};
-        // How far short of the wall the eye is held.
-        float wall_margin{3.0f};
-        // ETraceTypeQuery: 1 is Visibility, 2 is Camera. Camera by default because the
-        // game's own collision profiles have the Pawn channel ignore Camera, so the trace
-        // cannot be blocked by the player's own capsule.
-        int   trace_channel{2};
     };
 
     // Call once per tick with the mesh carrying the character. Does nothing useful until

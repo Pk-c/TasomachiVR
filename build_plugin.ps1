@@ -26,12 +26,9 @@ $sources = @(
     "plugin\TasomachiVRPlugin.cpp"
     "plugin\vrpage.cpp"
     "plugin\body.cpp"
-    "plugin\reflect.cpp"
     "plugin\hands.cpp"
     "plugin\animbp.cpp"
-    "plugin\roomscale.cpp"
     "plugin\eye.cpp"
-    "plugin\umg.cpp"
 ) -join " "
 
 # /MT: the plugin is loaded into the game's process, so avoid any dependency on the

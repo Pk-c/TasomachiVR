@@ -71,19 +71,12 @@ public:
         // right facing one way and drifts as soon as the player turns - which is exactly
         // what happened. Live-switchable rather than guessed at a second time.
         // 0 = controller then offset, 1 = offset then controller.
-        int   compose_order{0};
 
         // How far the elbow hint sits out from the arm, along her own shoulder axis, and
         // how far below. Signed: negating the first flips which way the elbow folds.
         float elbow_out{25.0f};
         float elbow_down{10.0f};
     };
-
-    // Assigns the class to the mesh asset as soon as the asset exists, whether or not
-    // the player is in gameplay yet. Winning that race is what avoids needing to rebuild
-    // the component's animation later: the engine's own InitAnim then picks the Blueprint
-    // up when the character spawns.
-    void prepare();
 
     // Call every tick while in gameplay. Does the loading and assignment once, then only
     // writes variables.
@@ -94,6 +87,7 @@ public:
 private:
     bool ensure_class();
     bool cdo_ready();
+    void nudge_rebuild(uevr::API::UObject* mesh);
     // Assigns the class and asks the component to rebuild its animation. Called again
     // while no instance has appeared: latching after a single attempt was a real defect -
     // if the animation system was not ready at that instant, nothing ever retried.
@@ -120,16 +114,13 @@ private:
     // Measured once per pawn, from LeftArm -> LeftForeArm -> LeftHand, so nothing about
     // her size has to be assumed.
     float m_arm_length{0.0f};
-    int  m_reinit_attempts{0};
-    int  m_reinit_wait{0};
     int  m_instance_age{0};
-    // Set once the by-path assignment has landed, so prepare() stops looking the asset up.
-    // Re-finding and dereferencing it every frame is what crashed the whole pre-tick.
-    // The instance we built ourselves, when the engine would not.
-    uevr::API::UObject* m_spawned{nullptr};
+    // Fallback rebuild: how long we have waited for an instance, and how many nudges we
+    // have given the engine.
+    int  m_wait{0};
+    int  m_nudges{0};
     // How long we have been waiting for the CDO before giving it the benefit of the doubt.
     int  m_cdo_wait{0};
-    bool m_prepared{false};
     bool m_refused{false};
     bool m_load_failed{false};
     int  m_retry{0};

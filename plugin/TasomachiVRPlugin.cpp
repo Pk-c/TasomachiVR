@@ -6,11 +6,12 @@
 // head tracking. From C++ the HMD pose is directly readable, so the world yaw can be
 // derived rather than guessed.
 //
-// Split with the Lua script, which still runs:
-//   Lua  -> view POSITION (head bone, anchoring), mesh hiding, spring arm collapse
-//   C++  -> view ROTATION, snap turn, HMD yaw, body yaw, forward eye offset
-// They write different fields of different structs, so callback ordering cannot make
-// them collide.
+// Split with the Lua script, which still runs but is down to one job:
+//   Lua  -> collapsing the camera boom
+//   C++  -> everything else: view position and rotation, snap turn, body yaw, the body
+//           itself, the VR settings page, and the arms
+// The eye moved to C++ because two callbacks writing the same struct was a race waiting
+// to be noticed, and only this side can see the headset.
 //
 // The game has two playable pawns and they must not be treated alike:
 //
@@ -33,10 +34,7 @@
 #include "eye.hpp"
 #include "animbp.hpp"
 #include "hands.hpp"
-#include "reflect.hpp"
-#include "roomscale.hpp"
 #include "settings.hpp"
-#include "umg.hpp"
 #include "vrpage.hpp"
 
 #include <atomic>
@@ -55,10 +53,7 @@ using tasomachivr::AnimBp;
 using tasomachivr::Body;
 using tasomachivr::Eye;
 using tasomachivr::Hands;
-using tasomachivr::Reflect;
-using tasomachivr::Roomscale;
 using tasomachivr::MenuSettings;
-using tasomachivr::Umg;
 using tasomachivr::VrPage;
 
 namespace {
@@ -117,19 +112,16 @@ struct Config {
     // UEVR projects into the headset - it is why the HUD and the pause menu are visible
     // - so it is where a menu can actually live. Retried until the widgets exist,
     // because the pause menu class is only created once the player opens it.
-    bool  widget_probe   = false;
 
     // Logs what this build actually exposes for the articulated-arms work: whether
     // UPoseableMeshComponent and its pose functions are reachable, whether a spawned
     // component can be registered, and whether the physics fallback is available.
     // One run answers all three; see reflect.hpp.
-    bool  reflect_probe  = false;
 
     // Borrows a spare ArrowComponent per hand, asks UEVR's UObjectHook to drive it from
     // the motion controller, and reports where the two end up relative to the head bone.
     // That is the target the physics-driven arms will chase, and reading it back from
     // UEVR is what avoids deriving the OpenXR-to-world mapping by hand.
-    bool  hand_probe     = false;
 
     // Articulated arms through our own post-process AnimBP. Off until the patch pak that
     // carries it is installed: with no class to load, this only costs a handful of failed
@@ -155,18 +147,6 @@ struct Config {
     float arms_elbow_down = 10.0f;
     // Wrist relative to the controller, in centimetres along the controller's own axes.
     float arms_wrist_offset[3] = {0.0f, 0.0f, 0.0f};   // forward, right, up
-    // 0 = controller then offset, 1 = offset then controller.
-    int   arms_compose_order = 0;
-
-    // The body follows the player's own steps. On foot only - the flying boat is a pawn
-    // too, and displacing it would sail the boat with the player's footsteps. See
-    // roomscale.hpp for why this needs the standing origin shifted as well.
-    bool  roomscale      = false;
-    // Centimetres in a single frame. A tracking glitch or a recentre can produce a metre
-    // at once, and teleporting the character across the room is worse than losing a step.
-    float roomscale_max_step = 25.0f;
-    int   roomscale_yaw_source = 0;
-    int   roomscale_compensate = 1;
 
     // Reuse the game's own options page as the VR menu. Five of its rows are camera
     // settings that VR makes meaningless - we own the camera, so nothing reads them any
@@ -180,19 +160,12 @@ struct Config {
     // the head bone collapsed. See body.hpp for what each costs.
     int   body_mode      = 1;
 
-    // The eye. This used to live in the Lua script; it moved to C++ because the wall test
-    // has to happen where the eye is computed. See eye.hpp.
+    // The eye follows the head bone, filtered. See eye.hpp for why the filter needs a
+    // hard clamp as well as a low-pass.
     bool  eye_stabilise  = true;
     float eye_bob_damping = 9.0f;
     float eye_sway_damping = 22.0f;
     float eye_sway_limit = 4.0f;
-    // Holds the view at a wall instead of letting the player lean their head through a
-    // partition. The roomscale move already sweeps the capsule, so the body cannot walk
-    // through geometry - but nothing stopped the head.
-    bool  eye_collide    = true;
-    float eye_probe_radius = 12.0f;
-    float eye_wall_margin = 3.0f;
-    int   eye_trace_channel = 2;
 
     int   log_every      = 240;    // frames between diagnostic lines
 };
@@ -272,34 +245,20 @@ public:
         m_phase = 2;
         m_gameplay.store(compute_gameplay());
 
-        // Before the gameplay gate: assigning the Blueprint early enough that the engine's
-        // own InitAnim picks it up is far cheaper than rebuilding the animation afterwards.
-        m_phase = 3;
-        if (m_config.arms && !m_phase_disabled[3]) {
-            m_animbp.prepare();
-        }
-
         m_phase = 4;
         if (!m_phase_disabled[4]) {
             drive_vr_page();
         }
         m_phase = 5;
 
-        // Gated on gameplay: the one-shot fired at the main menu on the engine's
-        // SpectatorPawn, which has no mesh, so the live half reported nothing.
-        if (m_config.reflect_probe && m_gameplay.load()) {
-            m_reflect.run(m_pawn);
-        }
-
         // The hands are tracked whenever the arms need them, and the probe only decides
         // whether it also gets logged.
         m_phase = 6;
-        if ((m_config.arms || m_config.hand_probe) && m_gameplay.load()
-            && !m_phase_disabled[6]) {
+        if (m_config.arms && m_gameplay.load() && !m_phase_disabled[6]) {
             m_hands.set_wrist_offset(m_config.arms_wrist_offset[0],
                                      m_config.arms_wrist_offset[1],
                                      m_config.arms_wrist_offset[2]);
-            m_hands.update(m_pawn, m_config.hand_probe, m_final_yaw.load());
+            m_hands.update(m_pawn, m_final_yaw.load());
         }
 
         m_phase = 7;
@@ -331,22 +290,9 @@ public:
             }
             tuning.elbow_out = m_config.arms_elbow_out;
             tuning.elbow_down = m_config.arms_elbow_down;
-            tuning.compose_order = m_config.arms_compose_order;
             m_animbp.update(m_pawn, targets, tuning);
         }
 
-        m_phase = 8;
-        if (m_config.widget_probe && !m_phase_disabled[8]) {
-            m_widget_time += delta;
-            if (m_widget_time >= 0.5f) {
-                m_widget_time = 0.0f;
-                m_umg.discover();
-                m_umg.probe(L"WidgetBlueprintGeneratedClass /Game/ThirdPersonBP/Blueprints/"
-                            L"WBP_PauseMenu.WBP_PauseMenu_C");
-                m_umg.probe(L"WidgetBlueprintGeneratedClass /Game/ThirdPersonBP/Blueprints/"
-                            L"WBP_HUD.WBP_HUD_C");
-            }
-        }
 
     }
 
@@ -368,15 +314,6 @@ public:
         }
 
         drive_eye(delta);
-
-        // Only on foot, and only while the character is the one being framed: the boat
-        // is a pawn as well, and stepping sideways must not sail it.
-        Roomscale::Settings roomscale{};
-        roomscale.max_step = m_config.roomscale_max_step;
-        roomscale.yaw_source = m_config.roomscale_yaw_source;
-        roomscale.compensate = m_config.roomscale_compensate;
-        m_roomscale.update(m_pawn, m_config.roomscale && m_is_character, m_snap_yaw.load(),
-                           m_final_yaw.load(), roomscale);
 
         if (++m_frames >= m_config.log_every) {
             m_frames = 0;
@@ -533,10 +470,6 @@ private:
         settings.bob_damping = m_config.eye_bob_damping;
         settings.sway_damping = m_config.eye_sway_damping;
         settings.sway_limit = m_config.eye_sway_limit;
-        settings.collide = m_config.eye_collide;
-        settings.probe_radius = m_config.eye_probe_radius;
-        settings.wall_margin = m_config.eye_wall_margin;
-        settings.trace_channel = m_config.eye_trace_channel;
 
         auto* mesh = deref_object(m_pawn, L"Mesh");
         if (mesh == nullptr) {
@@ -771,9 +704,8 @@ private:
             // rotates the body every frame, which is what the trembling was. The camera sits
             // on the Head bone of that body, so it inherited the shake rather than causing it.
             //
-            // Same shape of fix as the roomscale deadzone: a continuous noisy signal driving
-            // a rigid body needs a resting state. Holding the last value below the threshold
-            // gives it one. Above the threshold it tracks continuously, so a deliberate turn
+            // A continuous noisy signal driving a rigid body needs a resting state, and
+            // holding the last value below the threshold gives it one. Above the threshold it tracks continuously, so a deliberate turn
             // is never stepped - the worst-case lag is the deadzone itself, well under what
             // anyone can see.
             const float wanted = m_final_yaw.load();
@@ -913,9 +845,6 @@ private:
             else if (key == "SmoothTurnSpeed") m_config.smooth_speed = (float)std::atof(value.c_str());
             else if (key == "TurnDeadzone")  m_config.turn_deadzone = (float)std::atof(value.c_str());
             else if (key == "PauseButton")   m_config.pause_button = std::atoi(value.c_str());
-            else if (key == "WidgetProbe")   m_config.widget_probe = std::atoi(value.c_str()) != 0;
-            else if (key == "ReflectProbe")  m_config.reflect_probe = std::atoi(value.c_str()) != 0;
-            else if (key == "HandProbe")     m_config.hand_probe = std::atoi(value.c_str()) != 0;
             else if (key == "Arms")          m_config.arms = std::atoi(value.c_str()) != 0;
             else if (key == "ArmsAlpha")     m_config.arms_alpha = (float)std::atof(value.c_str());
             else if (key == "ArmsDebugTilt")
@@ -944,15 +873,6 @@ private:
                 m_config.arms_wrist_offset[1] = (float)std::atof(value.c_str());
             else if (key == "ArmsWristUp")
                 m_config.arms_wrist_offset[2] = (float)std::atof(value.c_str());
-            else if (key == "Roomscale")     m_config.roomscale = std::atoi(value.c_str()) != 0;
-            else if (key == "RoomscaleMaxStep")
-                m_config.roomscale_max_step = (float)std::atof(value.c_str());
-            else if (key == "RoomscaleYawSource")
-                m_config.roomscale_yaw_source = std::atoi(value.c_str());
-            else if (key == "RoomscaleCompensate")
-                m_config.roomscale_compensate = std::atoi(value.c_str());
-            else if (key == "ArmsComposeOrder")
-                m_config.arms_compose_order = std::atoi(value.c_str());
             else if (key == "GraftPauseMenu")
                 m_config.graft_pause_menu = std::atoi(value.c_str()) != 0;
             else if (key == "BodyMode")      m_config.body_mode = std::atoi(value.c_str());
@@ -964,13 +884,6 @@ private:
                 m_config.eye_sway_damping = (float)std::atof(value.c_str());
             else if (key == "EyeSwayLimit")
                 m_config.eye_sway_limit = (float)std::atof(value.c_str());
-            else if (key == "EyeCollide")    m_config.eye_collide = std::atoi(value.c_str()) != 0;
-            else if (key == "EyeProbeRadius")
-                m_config.eye_probe_radius = (float)std::atof(value.c_str());
-            else if (key == "EyeWallMargin")
-                m_config.eye_wall_margin = (float)std::atof(value.c_str());
-            else if (key == "EyeTraceChannel")
-                m_config.eye_trace_channel = std::atoi(value.c_str());
             else if (key == "LogEvery")      m_config.log_every = std::atoi(value.c_str());
         }
     }
@@ -979,11 +892,8 @@ private:
 
     Body      m_body{};
     Eye       m_eye{};
-    Roomscale m_roomscale{};
     Hands   m_hands{};
     AnimBp  m_animbp{};
-    Reflect m_reflect{};
-    Umg    m_umg{};
     VrPage m_vrpage{};
     float  m_widget_time{0.0f};
 

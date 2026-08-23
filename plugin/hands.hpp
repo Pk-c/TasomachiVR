@@ -43,7 +43,7 @@ public:
 
     // Attaches the borrowed components on the first call for a pawn, then reports.
     // Returns false while nothing usable was found.
-    bool update(uevr::API::UObject* pawn, bool log, float head_yaw);
+    bool update(uevr::API::UObject* pawn, float head_yaw);
 
     // World transforms of the two controllers, read back from the components UEVR drives.
     // Valid only while tracked() is true. The rotation matters as much as the position:
@@ -58,7 +58,6 @@ public:
 private:
     // Where the controller is, worked out from the VR poses rather than asked of UEVR:
     // the fallback if the UObjectHook attachment cannot be made to drive anything.
-    bool computed(bool right, float head_yaw, const Vec3& head, Vec3& out, Vec3& raw) const;
 
     // UObjectHook needs to be enabled for the attachment to be driven at all, which is a
     // profile setting rather than something the plugin can switch on.
@@ -75,7 +74,6 @@ private:
     float m_offset[3]{0.0f, 0.0f, 0.0f};   // forward, right, up
     bool m_tracked{false};
     bool m_attached{false};
-    int  m_log_age{0};
 };
 
 } // namespace tasomachivr
