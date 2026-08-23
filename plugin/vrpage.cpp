@@ -280,6 +280,7 @@ void VrPage::update(API::UObject* pawn, MenuSettings& live) {
         set_slider(m_rows[YawTrim].control,
                    to_slider(live.yaw_offset, m_rows[YawTrim].lo, m_rows[YawTrim].hi));
         set_checkbox(m_rows[SmoothTurn].control, live.turn_mode == 1);
+        set_checkbox(m_rows[ShowBody].control, live.body_mode == 1);
     }
 
     poll(live);
@@ -345,6 +346,7 @@ bool VrPage::build(API::UObject* menu) {
         {EyeForward,  L"Eye forward",  L"cm",   -10.0f,  40.0f, 1.0f,  false},
         {EyeHeight,   L"Eye height",   L"cm",   -15.0f,  15.0f, 1.0f,  false},
         {YawTrim,     L"Yaw trim",     L"deg",  -20.0f,  20.0f, 1.0f,  false},
+        {ShowBody,    L"Show body",    nullptr,   0.0f,   1.0f, 1.0f,  true},
     };
 
     for (const auto& spec : layout) {
@@ -497,10 +499,14 @@ void VrPage::poll(MenuSettings& live) {
     live.up_offset = read(EyeHeight);
     live.yaw_offset = read(YawTrim);
 
-    // The toggle carries no number, but it still wants the focus marker.
-    auto& toggle = m_rows[SmoothTurn];
-    refresh_label(toggle, 0.0f, has_focus(toggle.control));
-    live.turn_mode = checkbox_checked(toggle.control) ? 1 : 0;
+    // The toggles carry no number, but they still want the focus marker.
+    auto& smooth = m_rows[SmoothTurn];
+    refresh_label(smooth, 0.0f, has_focus(smooth.control));
+    live.turn_mode = checkbox_checked(smooth.control) ? 1 : 0;
+
+    auto& body = m_rows[ShowBody];
+    refresh_label(body, 0.0f, has_focus(body.control));
+    live.body_mode = checkbox_checked(body.control) ? 1 : 0;
 }
 
 } // namespace tasomachivr

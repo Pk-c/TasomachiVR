@@ -31,21 +31,30 @@ local config = {
     -- the cosmetics. The two write different fields of different structs, so callback
     -- ordering between them cannot matter.
 
-    -- Anchor the view on the mesh COMPONENT rather than on the animated bone. The bone
-    -- carries the walk cycle, and head bob is a reliable way to make people sick in VR.
-    -- The bone still sets the eye *height*, but heavily filtered, so crouching and the
-    -- boat's gentle idle still read while the ~5 Hz bob does not.
+    -- The eye FOLLOWS THE HEAD BONE, filtered - it is not anchored on the mesh
+    -- component any more.
     --
-    -- The component, not the actor: on foot the two are nearly interchangeable, but on
-    -- the boat the actor origin is the hull while the character stands somewhere on the
-    -- deck. The mesh component sits at her feet in both cases and, unlike the bone,
-    -- carries no animation - so it is the one anchor that is right for both pawns.
-    stabilize        = true,
-    height_smoothing = 3.0,
+    -- Anchoring on the component was right while the body was invisible: the component
+    -- carries no animation, so it gave a rock-steady view. It becomes wrong the moment
+    -- the body is drawn, because the body is animated relative to that component. The
+    -- head slides sideways when walking, and a jump throws it in front of the eye.
+    --
+    -- So the eye tracks the bone, and the bob is removed by a low-pass with a HARD
+    -- LIMIT: the filtered eye may never sit further than sway_limit from where the head
+    -- really is. Small oscillations - the ~5 Hz walk cycle - are damped away, while a
+    -- jump or a crouch is followed exactly, because those exceed the limit immediately.
+    -- A plain low-pass cannot do both; the clamp is what separates them.
+    stabilize    = true,
+    -- Higher follows faster. Vertical carries almost all of the bob, so it is damped
+    -- harder than horizontal.
+    bob_damping  = 9.0,
+    sway_damping = 22.0,
+    -- Centimetres. Beyond this the filter gives up and tracks the head exactly.
+    sway_limit   = 4.0,
 
-    hide_body     = true,
-    -- "mesh" | "bone" | "none" - see set_body_hidden for the trade-off each carries.
-    hide_mode     = "mesh",
+    -- Body visibility used to live here. It is the plugin's now (see plugin/body.hpp):
+    -- the Lua sandbox cannot read the ini, so a setting kept here could never be
+    -- exposed on the VR settings page.
     collapse_boom = true,
 }
 
@@ -54,18 +63,15 @@ local state = {
     meshes      = nil,  -- skeletal mesh components of the pawn, rebuilt when it changes
     head_mesh   = nil,  -- the one that actually has the head bone
     booms       = nil,  -- spring arm components of the pawn
-    hidden      = false,
     gameplay    = false,
-    eye_height  = nil,  -- filtered head-above-component offset
+    eye         = nil,  -- filtered world position of the eye
 }
 
 local d = {
     ticks      = 0,
     pawn_class = "-",
     socket     = "-",
-    anchor     = "-",
     components = "-",
-    hide       = "-",
     boom       = "-",
     readback   = "-",
 }
@@ -205,33 +211,6 @@ local function head_location()
     return nil
 end
 
---- The animation-free anchor: where the mesh component itself sits. See config.stabilize.
-local function anchor_location()
-    local mesh = state.head_mesh
-    if mesh ~= nil then
-        local loc = try(function() return mesh:K2_GetComponentLocation() end)
-        local x, y, z = xyz(loc)
-        if x ~= nil then
-            d.anchor = "MeshComponent"
-            return x, y, z
-        end
-    end
-
-    -- Only reached if the mesh component transform is unavailable, which would be odd.
-    local pawn = state.pawn
-    if pawn ~= nil then
-        local loc = try(function() return pawn:K2_GetActorLocation() end)
-        local x, y, z = xyz(loc)
-        if x ~= nil then
-            d.anchor = "ActorLocation"
-            return x, y, z
-        end
-    end
-
-    d.anchor = "NONE"
-    return nil
-end
-
 local function player_controller()
     return try(function() return api:get_player_controller(0) end)
 end
@@ -269,80 +248,6 @@ local function compute_gameplay()
     return same_object(target, state.pawn)
 end
 
---- Hiding the body is a compromise, because UE4 visibility is per primitive, never per
---- bone. HideBoneByName collapses the bone in the skinning itself, so every pass sees
---- the change alike - the shadow loses its head along with the view. There is no way to
---- drop one bone from the base pass only.
----
----   "mesh" : whole mesh hidden from every view, but bCastHiddenShadow keeps it casting
----            a complete and correct shadow. Nothing of the body is visible.
----   "bone" : head hidden, body still visible, shadow is headless. The head bone parents
----            the whole hair chain (Head_001..Head_006), so that goes with it.
----   "none" : leave the mesh alone
----
---- "mesh" is the default: from a viewpoint inside the head, a visible body reads worse
---- than no body at all, while a headless shadow is noticed constantly.
-local function set_body_hidden(hidden)
-    if config.hide_mode == "none" or state.meshes == nil then
-        return
-    end
-
-    if config.hide_mode == "mesh" then
-        -- Re-applied every frame, never latched: the game reasserts its own visibility
-        -- on its tick, so this has to run after it and keep running.
-        --
-        -- Several levers are tried because they fail differently. SetRenderInMainPass
-        -- is the one that matches the intent exactly: the primitive keeps feeding the
-        -- shadow depth pass while dropping out of the main pass.
-        local worked = {}
-        for _, component in ipairs(state.meshes) do
-            -- SetCastHiddenShadow reported failure in the log (shadow=0) while every
-            -- other lever worked, which left the character casting no shadow at all
-            -- once she was dropped from the main pass. The setter is not reachable, so
-            -- the property is written directly - it is what the setter would set, and
-            -- the render state is rebuilt by the visibility calls just below anyway.
-            if try(function() component:SetCastHiddenShadow(true) return true end)
-                or try(function() component.bCastHiddenShadow = true return true end) then
-                worked.shadow = true
-            end
-            if try(function() component:SetRenderInMainPass(not hidden) return true end) then
-                worked.mainpass = true
-            end
-            if try(function() component:SetVisibility(not hidden, true) return true end) then
-                worked.visibility = true
-            end
-            if try(function() component:SetOwnerNoSee(hidden) return true end) then
-                worked.ownernosee = true
-            end
-        end
-
-        local levers = {}
-        for _, k in ipairs({"mainpass", "visibility", "ownernosee", "shadow"}) do
-            levers[#levers + 1] = k .. "=" .. (worked[k] and "1" or "0")
-        end
-        d.hide = "mesh[" .. table.concat(levers, ",") .. "]"
-        state.hidden = hidden
-        return
-    end
-
-    if state.hidden == hidden or state.head_mesh == nil then
-        return
-    end
-
-    local mesh = state.head_mesh
-    local ok
-    if hidden then
-        ok = try(function() mesh:HideBoneByName(config.bone, 0) return true end)
-    else
-        ok = try(function() mesh:UnHideBoneByName(config.bone) return true end)
-    end
-
-    d.hide = ok and "bone:ok" or "bone:NONE"
-    if ok then
-        state.hidden = hidden
-    end
-end
-
 --- Collapses the boom onto its origin and kills the lag. The lag is what makes a third
 --- person camera feel weighty and is exactly what must not happen to a head: any delay
 --- between moving and the view following is felt immediately.
@@ -366,23 +271,34 @@ local function collapse_booms()
     d.boom = ok and ("ok x" .. #state.booms) or "NONE"
 end
 
---- Keeps the eye at a filtered height above the anchor. Returns nil until it has
---- something to work with.
-local function update_eye_height(delta)
-    local _, _, az = anchor_location()
-    local _, _, hz = head_location()
-    if az == nil or hz == nil then
+--- Moves the filtered eye towards the head bone. Returns nothing; the result lives in
+--- state.eye and is read by the view callback.
+local function update_eye(delta)
+    local hx, hy, hz = head_location()
+    if hx == nil then
         return
     end
 
-    local target = hz - az
-    if state.eye_height == nil then
-        state.eye_height = target
+    if state.eye == nil then
+        state.eye = {x = hx, y = hy, z = hz}
         return
     end
 
-    local alpha = clamp((delta or 0.016) * config.height_smoothing, 0.0, 1.0)
-    state.eye_height = state.eye_height + (target - state.eye_height) * alpha
+    local dt = delta or 0.016
+    local a_xy = clamp(dt * config.sway_damping, 0.0, 1.0)
+    local a_z = clamp(dt * config.bob_damping, 0.0, 1.0)
+
+    state.eye.x = state.eye.x + (hx - state.eye.x) * a_xy
+    state.eye.y = state.eye.y + (hy - state.eye.y) * a_xy
+    state.eye.z = state.eye.z + (hz - state.eye.z) * a_z
+
+    -- The clamp is the point: it is what lets one filter both damp the walk cycle and
+    -- follow a jump. Without it, smoothing enough to kill the bob also means the body
+    -- outruns the camera whenever the character really moves.
+    local limit = config.sway_limit
+    state.eye.x = clamp(state.eye.x, hx - limit, hx + limit)
+    state.eye.y = clamp(state.eye.y, hy - limit, hy + limit)
+    state.eye.z = clamp(state.eye.z, hz - limit, hz + limit)
 end
 
 local function refresh_pawn()
@@ -390,8 +306,7 @@ local function refresh_pawn()
 
     if pawn == nil then
         state.pawn, state.meshes, state.head_mesh, state.booms = nil, nil, nil, nil
-        state.hidden = false
-        state.eye_height = nil
+        state.eye = nil
         d.pawn_class = "no pawn"
         return
     end
@@ -401,10 +316,9 @@ local function refresh_pawn()
     end
 
     state.pawn = pawn
-    state.hidden = false
-    -- The eye height belongs to the pawn: boarding the boat changes where the feet are
-    -- relative to the head, and carrying the old value over would settle visibly.
-    state.eye_height = nil
+    -- The eye belongs to the pawn: boarding the boat teleports the head, and carrying
+    -- the old filtered position over would show as a visible slide into place.
+    state.eye = nil
 
     state.meshes = components_of_class(pawn, "Class /Script/Engine.SkeletalMeshComponent")
     state.head_mesh = find_head_mesh(state.meshes)
@@ -427,9 +341,7 @@ local function report()
         "gameplay=" .. tostring(state.gameplay),
         "components=" .. d.components,
         "socket=" .. d.socket,
-        "anchor=" .. d.anchor,
-        "eye_height=" .. (state.eye_height and ("%.1f"):format(state.eye_height) or "nil"),
-        "hide=" .. d.hide,
+        "eye_z=" .. (state.eye and ("%.1f"):format(state.eye.z) or "nil"),
         "boom=" .. d.boom,
         "readback=" .. d.readback,
     }, " ~ ")
@@ -446,7 +358,7 @@ uevr.sdk.callbacks.on_pre_engine_tick(function(engine, delta)
             collapse_booms()
         end
         if config.stabilize then
-            update_eye_height(delta)
+            update_eye(delta)
         end
     end
 
@@ -454,7 +366,7 @@ uevr.sdk.callbacks.on_pre_engine_tick(function(engine, delta)
     -- only on a change of signature, so it reports without becoming noise.
     if emit.count < emit.max then
         local sig = table.concat({d.pawn_class, tostring(state.gameplay), d.components,
-                                  d.socket, d.anchor, d.hide, d.boom}, "|")
+                                  d.socket, d.boom}, "|")
         if sig ~= emit.last or d.ticks >= emit.next_beat then
             emit.last = sig
             emit.next_beat = d.ticks + 3600
@@ -464,46 +376,12 @@ uevr.sdk.callbacks.on_pre_engine_tick(function(engine, delta)
     end
 end)
 
---- After the game's tick, so its own visibility handling has already run.
-uevr.sdk.callbacks.on_post_engine_tick(function()
-    if not config.hide_body then
-        return
-    end
-    -- Give the body back for cutscenes: they frame the character, so she has to be there.
-    set_body_hidden(state.gameplay)
-end)
-
-uevr.sdk.callbacks.on_pre_calculate_stereo_view_offset(function(device, view_index, world_to_meters, position, rotation, is_double)
-    if not state.gameplay then
-        d.readback = "skipped: not gameplay"
-        return
-    end
-
-    local hx, hy, hz = head_location()
-    if hx == nil then
-        d.readback = "skipped: no head location"
-        return
-    end
-
-    local x, y, z = hx, hy, hz
-    if config.stabilize then
-        local ax, ay, az = anchor_location()
-        if ax ~= nil and state.eye_height ~= nil then
-            x, y, z = ax, ay, az + state.eye_height
-        end
-    end
-
-    -- Position only. The plugin owns the view rotation and the forward eye offset,
-    -- because it is the only side that knows the headset yaw.
-    if set_xyz(position, x, y, z) then
-        d.readback = ("z=%.1f"):format(z)
-    else
-        d.readback = "POS WRITE FAILED"
-    end
-end)
+-- The view POSITION used to be written here. It is the plugin's now (plugin/eye.cpp):
+-- the wall test has to happen where the eye is computed, and two callbacks writing the
+-- same struct was a race waiting to be noticed. What is left on this side is the spring
+-- arm, which has nothing to do with either.
 
 uevr.sdk.callbacks.on_script_reset(function()
-    set_body_hidden(false)
     state.pawn, state.meshes, state.head_mesh, state.booms = nil, nil, nil, nil
-    state.eye_height = nil
+    state.eye = nil
 end)

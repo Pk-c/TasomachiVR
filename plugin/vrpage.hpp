@@ -32,6 +32,10 @@ public:
     // polls it. Call once per engine tick; does nothing while no menu exists.
     void update(uevr::API::UObject* pawn, MenuSettings& live);
 
+    // The stick has to be filtered differently while this page has the focus, so the
+    // caller needs to know when that is.
+    bool is_open() const { return m_open; }
+
 private:
     // One row: a label and a control, in a HorizontalBox. Sliders are always 0..1 and
     // mapped, so the engine side needs no range configuration.
@@ -55,6 +59,7 @@ private:
         EyeForward,
         EyeHeight,
         YawTrim,
+        ShowBody,
         RowCount,
     };
 

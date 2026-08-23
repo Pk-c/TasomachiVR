@@ -14,9 +14,10 @@ struct MenuSettings {
     float smooth_speed{90.0f};
     float turn_deadzone{0.2f};
     float forward_offset{10.0f};
-    float up_offset{0.0f};
+    float up_offset{6.0f};
     float yaw_offset{0.0f};
     int   pause_button{3};
+    int   body_mode{1};       // 0 whole mesh hidden, 1 headless body
 };
 
 } // namespace tasomachivr

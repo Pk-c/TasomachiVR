@@ -12,3 +12,4 @@ VR_RoomscaleMovement=false
 VR_MovementOrientation=0
 VR_WorldScale=1.000000
 VR_UseFMallocSceneViewExtensions=true
+UObjectHook_EnabledAtStartup=true

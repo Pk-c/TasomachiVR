@@ -29,11 +29,18 @@
 
 #include <uevr/Plugin.hpp>
 
+#include "body.hpp"
+#include "eye.hpp"
+#include "animbp.hpp"
+#include "hands.hpp"
+#include "reflect.hpp"
+#include "roomscale.hpp"
 #include "settings.hpp"
 #include "umg.hpp"
 #include "vrpage.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -44,6 +51,12 @@
 #include <vector>
 
 using API = uevr::API;
+using tasomachivr::AnimBp;
+using tasomachivr::Body;
+using tasomachivr::Eye;
+using tasomachivr::Hands;
+using tasomachivr::Reflect;
+using tasomachivr::Roomscale;
 using tasomachivr::MenuSettings;
 using tasomachivr::Umg;
 using tasomachivr::VrPage;
@@ -70,10 +83,13 @@ struct Config {
     float yaw_sign       = -1.0f;
     float yaw_offset     = 0.0f;
     bool  apply_body_yaw = true;
+    float body_yaw_deadzone = 0.35f;   // degrees
+    float menu_deadzone = 0.62f;
+    int   menu_repeat_ms = 260;
     bool  write_view_rot = true;
     // Pushes the eye out of the skull. Both are hot-reloaded from the ini.
     float forward_offset = 10.0f;
-    float up_offset      = 0.0f;
+    float up_offset      = 6.0f;
 
     // 0 = snap, 1 = smooth. Snap is the default: it is the comfortable choice for most
     // people, and smooth turning is the classic way to make someone sick in VR.
@@ -103,6 +119,55 @@ struct Config {
     // because the pause menu class is only created once the player opens it.
     bool  widget_probe   = false;
 
+    // Logs what this build actually exposes for the articulated-arms work: whether
+    // UPoseableMeshComponent and its pose functions are reachable, whether a spawned
+    // component can be registered, and whether the physics fallback is available.
+    // One run answers all three; see reflect.hpp.
+    bool  reflect_probe  = false;
+
+    // Borrows a spare ArrowComponent per hand, asks UEVR's UObjectHook to drive it from
+    // the motion controller, and reports where the two end up relative to the head bone.
+    // That is the target the physics-driven arms will chase, and reading it back from
+    // UEVR is what avoids deriving the OpenXR-to-world mapping by hand.
+    bool  hand_probe     = false;
+
+    // Articulated arms through our own post-process AnimBP. Off until the patch pak that
+    // carries it is installed: with no class to load, this only costs a handful of failed
+    // lookups before it gives up.
+    bool  arms           = false;
+    float arms_alpha     = 1.0f;
+    // Tilts the head by this many degrees through the Blueprint. The one number that says
+    // whether the whole chain - pak, load, assign, re-init, instance - is alive, without
+    // depending on the IK being right.
+    float arms_debug_tilt = 0.0f;
+    float arms_reach_scale = 1.0f;
+    // Constant correction on the wrist, in degrees. The hand bone's axes follow the rig's
+    // convention, not the controller's, so some multiple of 90 is almost always needed.
+    // Re-read about once a second like everything else, so it can be dialled in live in
+    // the headset instead of guessed at.
+    // One per side: the two hand bones carry mirrored local axes, so a correction that
+    // squares up one wrist puts the other exactly wrong.
+    float arms_left_hand_offset[3] = {-90.0f, 90.0f, 0.0f};    // pitch, yaw, roll
+    float arms_right_hand_offset[3] = {90.0f, 90.0f, 0.0f};
+    // Elbow hint, along her own shoulder axis. Negate the first to fold the elbow the
+    // other way.
+    float arms_elbow_out = 25.0f;
+    float arms_elbow_down = 10.0f;
+    // Wrist relative to the controller, in centimetres along the controller's own axes.
+    float arms_wrist_offset[3] = {0.0f, 0.0f, 0.0f};   // forward, right, up
+    // 0 = controller then offset, 1 = offset then controller.
+    int   arms_compose_order = 0;
+
+    // The body follows the player's own steps. On foot only - the flying boat is a pawn
+    // too, and displacing it would sail the boat with the player's footsteps. See
+    // roomscale.hpp for why this needs the standing origin shifted as well.
+    bool  roomscale      = false;
+    // Centimetres in a single frame. A tracking glitch or a recentre can produce a metre
+    // at once, and teleporting the character across the room is worse than losing a step.
+    float roomscale_max_step = 25.0f;
+    int   roomscale_yaw_source = 0;
+    int   roomscale_compensate = 1;
+
     // Reuse the game's own options page as the VR menu. Five of its rows are camera
     // settings that VR makes meaningless - we own the camera, so nothing reads them any
     // more - and they are already styled, already navigable, already saved by the game.
@@ -110,6 +175,24 @@ struct Config {
     // Note: the game persists these in its own settings save, so they survive without
     // TasomachiVR.ini having anything to say about it.
     bool  graft_pause_menu = false;
+
+    // What the player sees of themselves. 0 = whole mesh hidden, 1 = body visible with
+    // the head bone collapsed. See body.hpp for what each costs.
+    int   body_mode      = 1;
+
+    // The eye. This used to live in the Lua script; it moved to C++ because the wall test
+    // has to happen where the eye is computed. See eye.hpp.
+    bool  eye_stabilise  = true;
+    float eye_bob_damping = 9.0f;
+    float eye_sway_damping = 22.0f;
+    float eye_sway_limit = 4.0f;
+    // Holds the view at a wall instead of letting the player lean their head through a
+    // partition. The roomscale move already sweeps the capsule, so the body cannot walk
+    // through geometry - but nothing stopped the head.
+    bool  eye_collide    = true;
+    float eye_probe_radius = 12.0f;
+    float eye_wall_margin = 3.0f;
+    int   eye_trace_channel = 2;
 
     int   log_every      = 240;    // frames between diagnostic lines
 };
@@ -128,7 +211,43 @@ public:
             m_config.turn_mode, m_config.snap_angle, m_config.pause_button);
     }
 
-    void on_pre_engine_tick(API::UGameEngine*, float delta) override {
+    // Structured-exception wrapper, and the reason it exists: three modules driven from
+    // this callback - the pause-menu graft, the hands and the anim Blueprint - all went
+    // silent at once while everything driven from the POST tick kept working. The only
+    // reading consistent with that is the callback dying partway through, every frame,
+    // with nothing written down. A fault here is caught by the host and the game carries on
+    // regardless, so it costs nothing to notice and everything to miss.
+    //
+    // The body lives in its own function because __try cannot be used in a function that
+    // needs C++ object unwinding, and because m_phase then records exactly how far it got.
+    void on_pre_engine_tick(API::UGameEngine* engine, float delta) override {
+        __try {
+            pre_tick(engine, delta);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            const unsigned long code = GetExceptionCode();
+            // Disarm the module that faulted, permanently. Letting it fault again next
+            // frame is what turned one dangling pointer into "nothing works": the pause
+            // menu, the hands and the arms all sit after this point in the callback and
+            // were skipped for an entire session without a word in the log. One broken
+            // module should cost its own feature and no others.
+            if (m_phase >= 0 && m_phase < kPhases) {
+                m_phase_disabled[m_phase] = true;
+            }
+            if (m_fault_phase != m_phase || m_fault_code != code) {
+                m_fault_phase = m_phase;
+                m_fault_code = code;
+                API::get()->log_error("[TasomachiVR] PRE-TICK FAULTED at phase %d, code 0x%08lX"
+                                      " - that phase is now disabled; the rest of the tick"
+                                      " keeps running", m_phase, code);
+            }
+        }
+        if (m_phase > m_phase_max) {
+            m_phase_max = m_phase;
+        }
+    }
+
+    void pre_tick(API::UGameEngine*, float delta) {
+        m_phase = 0;
         if (m_snap_wait > 0.0f) {
             m_snap_wait -= delta;
         }
@@ -148,12 +267,76 @@ public:
             reload_config_if_changed();
         }
 
+        m_phase = 1;
         refresh_pawn();
+        m_phase = 2;
         m_gameplay.store(compute_gameplay());
 
-        drive_vr_page();
+        // Before the gameplay gate: assigning the Blueprint early enough that the engine's
+        // own InitAnim picks it up is far cheaper than rebuilding the animation afterwards.
+        m_phase = 3;
+        if (m_config.arms && !m_phase_disabled[3]) {
+            m_animbp.prepare();
+        }
 
-        if (m_config.widget_probe) {
+        m_phase = 4;
+        if (!m_phase_disabled[4]) {
+            drive_vr_page();
+        }
+        m_phase = 5;
+
+        // Gated on gameplay: the one-shot fired at the main menu on the engine's
+        // SpectatorPawn, which has no mesh, so the live half reported nothing.
+        if (m_config.reflect_probe && m_gameplay.load()) {
+            m_reflect.run(m_pawn);
+        }
+
+        // The hands are tracked whenever the arms need them, and the probe only decides
+        // whether it also gets logged.
+        m_phase = 6;
+        if ((m_config.arms || m_config.hand_probe) && m_gameplay.load()
+            && !m_phase_disabled[6]) {
+            m_hands.set_wrist_offset(m_config.arms_wrist_offset[0],
+                                     m_config.arms_wrist_offset[1],
+                                     m_config.arms_wrist_offset[2]);
+            m_hands.update(m_pawn, m_config.hand_probe, m_final_yaw.load());
+        }
+
+        m_phase = 7;
+        if (m_config.arms && m_gameplay.load() && !m_phase_disabled[7]) {
+            AnimBp::Targets targets{};
+            if (m_hands.tracked()) {
+                const auto& l = m_hands.left_position();
+                const auto& r = m_hands.right_position();
+                const auto& lr = m_hands.left_rotation();
+                const auto& rr = m_hands.right_rotation();
+                targets.left[0] = l.x;  targets.left[1] = l.y;  targets.left[2] = l.z;
+                targets.right[0] = r.x; targets.right[1] = r.y; targets.right[2] = r.z;
+                targets.left_rotation[0] = lr.x;
+                targets.left_rotation[1] = lr.y;
+                targets.left_rotation[2] = lr.z;
+                targets.right_rotation[0] = rr.x;
+                targets.right_rotation[1] = rr.y;
+                targets.right_rotation[2] = rr.z;
+                targets.have_left = targets.have_right = true;
+            }
+
+            AnimBp::Tuning tuning{};
+            tuning.alpha = m_config.arms_alpha;
+            tuning.debug_tilt = m_config.arms_debug_tilt;
+            tuning.reach_scale = m_config.arms_reach_scale;
+            for (int i = 0; i < 3; ++i) {
+                tuning.left_hand_offset[i] = m_config.arms_left_hand_offset[i];
+                tuning.right_hand_offset[i] = m_config.arms_right_hand_offset[i];
+            }
+            tuning.elbow_out = m_config.arms_elbow_out;
+            tuning.elbow_down = m_config.arms_elbow_down;
+            tuning.compose_order = m_config.arms_compose_order;
+            m_animbp.update(m_pawn, targets, tuning);
+        }
+
+        m_phase = 8;
+        if (m_config.widget_probe && !m_phase_disabled[8]) {
             m_widget_time += delta;
             if (m_widget_time >= 0.5f) {
                 m_widget_time = 0.0f;
@@ -167,7 +350,11 @@ public:
 
     }
 
-    void on_post_engine_tick(API::UGameEngine*, float) override {
+    void on_post_engine_tick(API::UGameEngine*, float delta) override {
+        // Before the early return: handing the character back for a cutscene is what
+        // needs to happen precisely when gameplay is false.
+        m_body.apply(m_pawn, m_config.body_mode, m_gameplay.load());
+
         if (!m_gameplay.load()) {
             return;
         }
@@ -179,6 +366,17 @@ public:
         if (m_is_character) {
             apply_body_orientation();
         }
+
+        drive_eye(delta);
+
+        // Only on foot, and only while the character is the one being framed: the boat
+        // is a pawn as well, and stepping sideways must not sail it.
+        Roomscale::Settings roomscale{};
+        roomscale.max_step = m_config.roomscale_max_step;
+        roomscale.yaw_source = m_config.roomscale_yaw_source;
+        roomscale.compensate = m_config.roomscale_compensate;
+        m_roomscale.update(m_pawn, m_config.roomscale && m_is_character, m_snap_yaw.load(),
+                           m_final_yaw.load(), roomscale);
 
         if (++m_frames >= m_config.log_every) {
             m_frames = 0;
@@ -222,15 +420,84 @@ public:
             state->Gamepad.sThumbRY = 0;
         }
 
+        if (user_index == 0 && m_vrpage.is_open()) {
+            filter_menu_stick(state);
+        }
+
         if (user_index == 0 && pause_button_held()) {
             state->Gamepad.wButtons |= XINPUT_GAMEPAD_START;
         }
     }
 
+    // Slate navigates the page from the left stick, and raw it is unusable: a thumbstick
+    // rests off-centre, crosses Slate's own 0.5 threshold on the way past, and repeats as
+    // fast as XInput is polled - which is several times per frame, not per tick. Three
+    // things fix it, and all three matter:
+    //
+    //   a real deadzone     so resting drift and the travel through centre emit nothing
+    //   one dominant axis   so a diagonal push cannot change the row and the value at once,
+    //                       which is most of what makes it feel uncontrollable
+    //   a repeat interval   so holding the stick steps at a readable rate instead of
+    //                       flying through the list
+    //
+    // Only while our own page is open: the game's menus keep the stick they were built for.
+    void filter_menu_stick(XINPUT_STATE* state) {
+        const float x = state->Gamepad.sThumbLX / 32767.0f;
+        const float y = state->Gamepad.sThumbLY / 32767.0f;
+        const float ax = std::fabs(x);
+        const float ay = std::fabs(y);
+
+        state->Gamepad.sThumbLX = 0;
+        state->Gamepad.sThumbLY = 0;
+
+        const bool horizontal = ax >= ay;
+        const float mag = horizontal ? ax : ay;
+
+        if (mag < m_config.menu_deadzone) {
+            m_menu_armed = true;      // back at centre: the next push counts immediately
+            return;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (!m_menu_armed) {
+            const auto since = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   now - m_menu_last).count();
+            if (since < m_config.menu_repeat_ms) {
+                return;               // held: swallow until the interval has passed
+            }
+        }
+        m_menu_armed = false;
+        m_menu_last = now;
+
+        // Emitted at full deflection so Slate is never left in the band where it has to
+        // decide for itself how fast to repeat.
+        const int16_t full = 32767;
+        if (horizontal) {
+            state->Gamepad.sThumbLX = x > 0.0f ? full : -full;
+        } else {
+            state->Gamepad.sThumbLY = y > 0.0f ? full : -full;
+        }
+    }
+
     void on_pre_calculate_stereo_view_offset(UEVR_StereoRenderingDeviceHandle, int, float,
-                                             UEVR_Vector3f*, UEVR_Rotatorf* rotation,
-                                             bool) override {
-        if (rotation == nullptr || !m_config.write_view_rot || !m_gameplay.load()) {
+                                             UEVR_Vector3f* position,
+                                             UEVR_Rotatorf* rotation, bool) override {
+        if (!m_gameplay.load()) {
+            return;
+        }
+
+        // Position and rotation are written in the same place now. The Lua script used to
+        // own the position, which meant two callbacks racing to write the same struct.
+        if (position != nullptr) {
+            float eye[3]{};
+            if (m_eye.apply(eye)) {
+                position->x = eye[0];
+                position->y = eye[1];
+                position->z = eye[2];
+            }
+        }
+
+        if (rotation == nullptr || !m_config.write_view_rot) {
             return;
         }
 
@@ -260,6 +527,24 @@ public:
     }
 
 private:
+    void drive_eye(float delta) {
+        Eye::Settings settings{};
+        settings.stabilise = m_config.eye_stabilise;
+        settings.bob_damping = m_config.eye_bob_damping;
+        settings.sway_damping = m_config.eye_sway_damping;
+        settings.sway_limit = m_config.eye_sway_limit;
+        settings.collide = m_config.eye_collide;
+        settings.probe_radius = m_config.eye_probe_radius;
+        settings.wall_margin = m_config.eye_wall_margin;
+        settings.trace_channel = m_config.eye_trace_channel;
+
+        auto* mesh = deref_object(m_pawn, L"Mesh");
+        if (mesh == nullptr) {
+            mesh = deref_object(m_pawn, L"SK_Pc_01");
+        }
+        m_eye.update(m_pawn, mesh, delta, m_gameplay.load(), settings);
+    }
+
     // Copies the page-editable settings out of the live config, lets the page work on
     // them, and copies back. Going through a separate struct keeps the loader-side
     // settings out of reach of the page by construction.
@@ -278,6 +563,7 @@ private:
         s.up_offset      = m_config.up_offset;
         s.yaw_offset     = m_config.yaw_offset;
         s.pause_button   = m_config.pause_button;
+        s.body_mode      = m_config.body_mode;
 
         // The page only writes while it is open, so the ini still governs the rest of
         // the time.
@@ -289,6 +575,7 @@ private:
         m_config.forward_offset = s.forward_offset;
         m_config.up_offset      = s.up_offset;
         m_config.yaw_offset     = s.yaw_offset;
+        m_config.body_mode      = s.body_mode;
     }
 
     static API::UObject* deref_object(API::UObject* owner, const wchar_t* name) {
@@ -340,6 +627,9 @@ private:
         m_pawn_playable = m_pawn_name.find(L"/Game/") != std::wstring::npos;
 
         m_flag_age = 0; // re-assert the movement flags immediately on a new pawn
+        // A new pawn faces wherever it spawned; carrying the old held yaw over would fight
+        // it for one deadzone's worth before catching up.
+        m_have_applied_yaw = false;
 
         API::get()->log_info("[TasomachiVR] pawn changed: %s | character=%d playable=%d",
                              narrow(m_pawn_name).c_str(), (int)m_is_character,
@@ -475,11 +765,29 @@ private:
         }
 
         if (m_control_rotation != nullptr) {
+            // A deadzone, because bUseControllerRotationYaw snaps the whole pawn onto this
+            // value every single tick. A headset is never perfectly still - it reports a
+            // fraction of a degree of noise even on a tripod - and feeding that straight in
+            // rotates the body every frame, which is what the trembling was. The camera sits
+            // on the Head bone of that body, so it inherited the shake rather than causing it.
+            //
+            // Same shape of fix as the roomscale deadzone: a continuous noisy signal driving
+            // a rigid body needs a resting state. Holding the last value below the threshold
+            // gives it one. Above the threshold it tracks continuously, so a deliberate turn
+            // is never stepped - the worst-case lag is the deadzone itself, well under what
+            // anyone can see.
+            const float wanted = m_final_yaw.load();
+            if (!m_have_applied_yaw ||
+                std::fabs(normalize_deg(wanted - m_applied_yaw)) > m_config.body_yaw_deadzone) {
+                m_applied_yaw = wanted;
+                m_have_applied_yaw = true;
+            }
+
             // Pitch stays flat: tipping the character because the player looked up is
             // exactly what breaks VR comfort. It also keeps the template's
             // camera-relative MoveForward from walking into the ground.
             m_control_rotation->pitch = 0.0f;
-            m_control_rotation->yaw = m_final_yaw.load();
+            m_control_rotation->yaw = m_applied_yaw;
             m_control_rotation->roll = 0.0f;
         }
 
@@ -498,7 +806,13 @@ private:
 
         if (m_cmc != nullptr) {
             m_cmc->set_bool_property(L"bOrientRotationToMovement", false);
-            m_cmc->set_bool_property(L"bUseControllerDesiredRotation", true);
+            // Deliberately FALSE, and it used to be true. The two flags do the same job by
+            // different means and they were fighting: bUseControllerRotationYaw snaps the
+            // pawn to the control rotation every tick, while bUseControllerDesiredRotation
+            // makes the movement component interpolate towards it at RotationRate. With
+            // both on, the interpolation won and the body trailed the head - which is
+            // exactly the lag felt when turning on the spot.
+            m_cmc->set_bool_property(L"bUseControllerDesiredRotation", false);
         }
     }
 
@@ -517,11 +831,11 @@ private:
     void log_state() {
         API::get()->log_info(
             "[TasomachiVR] quat_yaw=%.1f snap_yaw=%.1f final_yaw=%.1f snaps=%d | "
-            "character=%d playable=%d control=%d cmc=%d pause=%d/%d | pawn=%s",
+            "character=%d playable=%d control=%d cmc=%d pause=%d/%d | phase=%d/%d | pawn=%s",
             m_quat_yaw.load(), m_snap_yaw.load(), m_final_yaw.load(), m_snap_count,
             (int)m_is_character, (int)m_pawn_playable, (int)m_control_ok,
             (int)(m_cmc != nullptr), (int)m_pause_ok, (int)m_pause_seen,
-            narrow(m_pawn_name).c_str());
+            m_phase, m_phase_max, narrow(m_pawn_name).c_str());
     }
 
     // One settings file, in the game folder, next to everything else the player
@@ -584,6 +898,9 @@ private:
             if (key == "YawSign")            m_config.yaw_sign = (float)std::atof(value.c_str());
             else if (key == "YawOffset")     m_config.yaw_offset = (float)std::atof(value.c_str());
             else if (key == "ApplyBodyYaw")  m_config.apply_body_yaw = std::atoi(value.c_str()) != 0;
+            else if (key == "BodyYawDeadzone") m_config.body_yaw_deadzone = (float)std::atof(value.c_str());
+            else if (key == "MenuDeadzone")  m_config.menu_deadzone = (float)std::atof(value.c_str());
+            else if (key == "MenuRepeatMs")  m_config.menu_repeat_ms = std::atoi(value.c_str());
             else if (key == "WriteViewRot")  m_config.write_view_rot = std::atoi(value.c_str()) != 0;
             else if (key == "ForwardOffset") m_config.forward_offset = (float)std::atof(value.c_str());
             else if (key == "UpOffset")      m_config.up_offset = (float)std::atof(value.c_str());
@@ -597,14 +914,75 @@ private:
             else if (key == "TurnDeadzone")  m_config.turn_deadzone = (float)std::atof(value.c_str());
             else if (key == "PauseButton")   m_config.pause_button = std::atoi(value.c_str());
             else if (key == "WidgetProbe")   m_config.widget_probe = std::atoi(value.c_str()) != 0;
+            else if (key == "ReflectProbe")  m_config.reflect_probe = std::atoi(value.c_str()) != 0;
+            else if (key == "HandProbe")     m_config.hand_probe = std::atoi(value.c_str()) != 0;
+            else if (key == "Arms")          m_config.arms = std::atoi(value.c_str()) != 0;
+            else if (key == "ArmsAlpha")     m_config.arms_alpha = (float)std::atof(value.c_str());
+            else if (key == "ArmsDebugTilt")
+                m_config.arms_debug_tilt = (float)std::atof(value.c_str());
+            else if (key == "ArmsReachScale")
+                m_config.arms_reach_scale = (float)std::atof(value.c_str());
+            else if (key == "ArmsLeftHandOffsetPitch")
+                m_config.arms_left_hand_offset[0] = (float)std::atof(value.c_str());
+            else if (key == "ArmsLeftHandOffsetYaw")
+                m_config.arms_left_hand_offset[1] = (float)std::atof(value.c_str());
+            else if (key == "ArmsLeftHandOffsetRoll")
+                m_config.arms_left_hand_offset[2] = (float)std::atof(value.c_str());
+            else if (key == "ArmsRightHandOffsetPitch")
+                m_config.arms_right_hand_offset[0] = (float)std::atof(value.c_str());
+            else if (key == "ArmsRightHandOffsetYaw")
+                m_config.arms_right_hand_offset[1] = (float)std::atof(value.c_str());
+            else if (key == "ArmsRightHandOffsetRoll")
+                m_config.arms_right_hand_offset[2] = (float)std::atof(value.c_str());
+            else if (key == "ArmsElbowOut")
+                m_config.arms_elbow_out = (float)std::atof(value.c_str());
+            else if (key == "ArmsElbowDown")
+                m_config.arms_elbow_down = (float)std::atof(value.c_str());
+            else if (key == "ArmsWristForward")
+                m_config.arms_wrist_offset[0] = (float)std::atof(value.c_str());
+            else if (key == "ArmsWristRight")
+                m_config.arms_wrist_offset[1] = (float)std::atof(value.c_str());
+            else if (key == "ArmsWristUp")
+                m_config.arms_wrist_offset[2] = (float)std::atof(value.c_str());
+            else if (key == "Roomscale")     m_config.roomscale = std::atoi(value.c_str()) != 0;
+            else if (key == "RoomscaleMaxStep")
+                m_config.roomscale_max_step = (float)std::atof(value.c_str());
+            else if (key == "RoomscaleYawSource")
+                m_config.roomscale_yaw_source = std::atoi(value.c_str());
+            else if (key == "RoomscaleCompensate")
+                m_config.roomscale_compensate = std::atoi(value.c_str());
+            else if (key == "ArmsComposeOrder")
+                m_config.arms_compose_order = std::atoi(value.c_str());
             else if (key == "GraftPauseMenu")
                 m_config.graft_pause_menu = std::atoi(value.c_str()) != 0;
+            else if (key == "BodyMode")      m_config.body_mode = std::atoi(value.c_str());
+            else if (key == "EyeStabilise")
+                m_config.eye_stabilise = std::atoi(value.c_str()) != 0;
+            else if (key == "EyeBobDamping")
+                m_config.eye_bob_damping = (float)std::atof(value.c_str());
+            else if (key == "EyeSwayDamping")
+                m_config.eye_sway_damping = (float)std::atof(value.c_str());
+            else if (key == "EyeSwayLimit")
+                m_config.eye_sway_limit = (float)std::atof(value.c_str());
+            else if (key == "EyeCollide")    m_config.eye_collide = std::atoi(value.c_str()) != 0;
+            else if (key == "EyeProbeRadius")
+                m_config.eye_probe_radius = (float)std::atof(value.c_str());
+            else if (key == "EyeWallMargin")
+                m_config.eye_wall_margin = (float)std::atof(value.c_str());
+            else if (key == "EyeTraceChannel")
+                m_config.eye_trace_channel = std::atoi(value.c_str());
             else if (key == "LogEvery")      m_config.log_every = std::atoi(value.c_str());
         }
     }
 
     Config m_config{};
 
+    Body      m_body{};
+    Eye       m_eye{};
+    Roomscale m_roomscale{};
+    Hands   m_hands{};
+    AnimBp  m_animbp{};
+    Reflect m_reflect{};
     Umg    m_umg{};
     VrPage m_vrpage{};
     float  m_widget_time{0.0f};
@@ -614,6 +992,19 @@ private:
     std::atomic<float> m_turn_axis{0.0f};
     std::atomic<float> m_quat_yaw{0.0f};
     std::atomic<float> m_final_yaw{0.0f};
+    // The yaw actually written to the pawn, held still while the headset only jitters.
+    // How far the pre-tick got. 8 means it ran to the end; anything less, held across
+    // frames, is the phase it dies in.
+    static constexpr int kPhases = 9;
+    int m_phase{0};
+    int m_phase_max{0};
+    bool m_phase_disabled[kPhases]{};
+    int m_fault_phase{-1};
+    unsigned long m_fault_code{0};
+    bool m_menu_armed{true};
+    std::chrono::steady_clock::time_point m_menu_last{};
+    float m_applied_yaw{0.0f};
+    bool  m_have_applied_yaw{false};
 
     UEVR_ActionHandle m_pause_action{};
     bool m_pause_resolved{false};

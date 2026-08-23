@@ -311,6 +311,38 @@ inline bool copy_struct_arg(API::UObject* source, const wchar_t* property,
     return true;
 }
 
+struct Vec3 {
+    float x{};
+    float y{};
+    float z{};
+};
+
+// GetSocketTransform(InSocketName, TransformSpace) -> FTransform, space 0 being world.
+// FTransform is a quaternion then a translation, so the translation is read by offset
+// from the return value rather than by modelling the whole struct.
+inline bool socket_location(API::UObject* mesh, const wchar_t* bone, Vec3& out) {
+    Call call{mesh, L"GetSocketTransform"};
+    if (!call.ok) {
+        return false;
+    }
+    const API::FName name{bone};
+    if (!put(call, 0, name) || !put(call, 1, uint8_t{0})) {
+        return false;
+    }
+    mesh->process_event(call.fn, call.bytes.data());
+
+    auto* ret = return_param(call.fn);
+    if (ret == nullptr) {
+        return false;
+    }
+    const int32_t offset = ret->get_offset() + 16; // past FQuat Rotation
+    if (offset + static_cast<int32_t>(sizeof(Vec3)) > static_cast<int32_t>(call.bytes.size())) {
+        return false;
+    }
+    std::memcpy(&out, call.bytes.data() + offset, sizeof(Vec3));
+    return true;
+}
+
 // Builds an FText from a string and hands it to a widget's SetText.
 //
 // The FText is copied out of Conv_StringToText's blob and into SetText's by offset and

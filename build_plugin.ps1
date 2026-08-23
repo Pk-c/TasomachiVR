@@ -25,6 +25,12 @@ if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found in $inst" }
 $sources = @(
     "plugin\TasomachiVRPlugin.cpp"
     "plugin\vrpage.cpp"
+    "plugin\body.cpp"
+    "plugin\reflect.cpp"
+    "plugin\hands.cpp"
+    "plugin\animbp.cpp"
+    "plugin\roomscale.cpp"
+    "plugin\eye.cpp"
     "plugin\umg.cpp"
 ) -join " "
 

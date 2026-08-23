@@ -130,13 +130,27 @@ if (Test-Path $plugin) {
     Write-Host "  payload    (no plugin built yet - loader only)"
 }
 
-# Do not overwrite a TasomachiVR.ini the user has already tuned.
+# Do not overwrite a TasomachiVR.ini the player has already tuned - but SAY SO when the
+# deployed one has drifted from the repo's. Keeping it silently is how a test session ends
+# up running settings nobody intended, which has already cost one full round trip here.
 $ini = Join-Path $payload "TasomachiVR.ini"
+$src = Join-Path $root "payload\TasomachiVR.ini"
 if (-not (Test-Path $ini)) {
-    Copy-Item (Join-Path $root "payload\TasomachiVR.ini") $ini -Force
+    Copy-Item $src $ini -Force
     Write-Host "  payload <- TasomachiVR.ini"
 } else {
-    Write-Host "  payload    TasomachiVR.ini (kept)"
+    $strip = { param($f) (Get-Content $f) | Where-Object { $_ -notmatch '^\s*;' -and $_ -match '\S' } }
+    $diff = Compare-Object (& $strip $src) (& $strip $ini)
+    if ($diff) {
+        Write-Host "  payload    TasomachiVR.ini KEPT, and it differs from the repo copy:" -ForegroundColor Yellow
+        foreach ($d in $diff) {
+            $side = if ($d.SideIndicator -eq '<=') { 'repo ' } else { 'live ' }
+            Write-Host ("               {0}{1}" -f $side, $d.InputObject) -ForegroundColor Yellow
+        }
+        Write-Host "             Copy it over by hand if the repo values are the ones you want." -ForegroundColor Yellow
+    } else {
+        Write-Host "  payload    TasomachiVR.ini (kept, identical)"
+    }
 }
 
 Copy-Item $built $proxy -Force
