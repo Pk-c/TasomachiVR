@@ -31,6 +31,19 @@ public:
         float sway_damping{22.0f};
         // Centimetres. Past this the filter gives up and tracks the head exactly.
         float sway_limit{4.0f};
+
+        // One-euro filter on the ANCHOR. Cutoff, in hertz, is min_cutoff + beta * speed, so
+        // smoothing is heavy while you are still and nearly absent while you move. A single
+        // fixed amount of smoothing cannot do both: enough to kill tracking jitter is also
+        // enough to leave the view dragging behind you when walking.
+        float anchor_min_cutoff{0.5f};
+        float anchor_beta{0.10f};
+
+        // While airborne, freeze where the head sits INSIDE the body. The jump animation
+        // curls the character up, dragging the head bone down and forward through the
+        // chest; that is pose, not head movement, and following it put the camera in the
+        // torso. Frozen, the view rides the capsule, which is what a jump should feel like.
+        bool  airborne{false};
     };
 
     // Call once per tick with the mesh carrying the character. Does nothing useful until
@@ -45,6 +58,13 @@ public:
 private:
     uevr::API::UObject* m_pawn{nullptr};
     float m_eye[3]{};
+    // The head's position RELATIVE to the mesh component - what actually gets filtered.
+    float m_off[3]{};
+    // The filtered component position, plus the state the one-euro filter needs.
+    float m_anchor[3]{};
+    float m_prev[3]{};
+    float m_rate[3]{};
+    bool  m_have_anchor{false};
     bool  m_have_eye{false};
     bool  m_reported{false};
 };

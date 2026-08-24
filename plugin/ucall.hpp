@@ -320,6 +320,16 @@ struct Vec3 {
 // GetSocketTransform(InSocketName, TransformSpace) -> FTransform, space 0 being world.
 // FTransform is a quaternion then a translation, so the translation is read by offset
 // from the return value rather than by modelling the whole struct.
+// K2_GetComponentLocation is on SceneComponent and returns an FVector in world space.
+inline bool component_location(API::UObject* component, Vec3& out) {
+    Call call{component, L"K2_GetComponentLocation"};
+    if (!call.ok) {
+        return false;
+    }
+    component->process_event(call.fn, call.bytes.data());
+    return result(call, out);
+}
+
 inline bool socket_location(API::UObject* mesh, const wchar_t* bone, Vec3& out) {
     Call call{mesh, L"GetSocketTransform"};
     if (!call.ok) {

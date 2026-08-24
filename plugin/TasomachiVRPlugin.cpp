@@ -166,6 +166,9 @@ struct Config {
     float eye_bob_damping = 9.0f;
     float eye_sway_damping = 22.0f;
     float eye_sway_limit = 4.0f;
+    float eye_anchor_min_cutoff = 0.5f;
+    float eye_anchor_beta = 0.10f;
+    bool  eye_freeze_in_air = true;
 
     int   log_every      = 240;    // frames between diagnostic lines
 };
@@ -177,7 +180,12 @@ public:
     void on_initialize() override {
         load_config();
         API::get()->log_info(
-            "[TasomachiVR] plugin up | yaw_sign=%.0f yaw_offset=%.1f apply_body_yaw=%d "
+            // __DATE__ / __TIME__ are stamped at compile time, so the log always says which
+            // build is running. Worth one line: a source tree and a deployed DLL can drift
+            // apart without anything looking wrong, and that has already cost a whole round
+            // of testing where the conclusions were drawn about the wrong binary.
+            "[TasomachiVR] plugin up | built " __DATE__ " " __TIME__
+            " | yaw_sign=%.0f yaw_offset=%.1f apply_body_yaw=%d "
             "write_view_rot=%d forward=%.1f up=%.1f turn=%d snap=%.0fdeg pause=%d",
             m_config.yaw_sign, m_config.yaw_offset, (int)m_config.apply_body_yaw,
             (int)m_config.write_view_rot, m_config.forward_offset, m_config.up_offset,
@@ -470,6 +478,17 @@ private:
         settings.bob_damping = m_config.eye_bob_damping;
         settings.sway_damping = m_config.eye_sway_damping;
         settings.sway_limit = m_config.eye_sway_limit;
+        settings.anchor_min_cutoff = m_config.eye_anchor_min_cutoff;
+        settings.anchor_beta = m_config.eye_anchor_beta;
+
+        // MovementMode is a TEnumAsByte - a whole byte, not a bitfield, so reading it is
+        // safe. EMovementMode: 1 = Walking, 3 = Falling. Only a Character has one.
+        settings.airborne = false;
+        if (m_config.eye_freeze_in_air && m_cmc != nullptr) {
+            if (auto* mode = m_cmc->get_property_data<uint8_t>(L"MovementMode")) {
+                settings.airborne = (*mode == 3);
+            }
+        }
 
         auto* mesh = deref_object(m_pawn, L"Mesh");
         if (mesh == nullptr) {
@@ -882,6 +901,12 @@ private:
                 m_config.eye_bob_damping = (float)std::atof(value.c_str());
             else if (key == "EyeSwayDamping")
                 m_config.eye_sway_damping = (float)std::atof(value.c_str());
+            else if (key == "EyeAnchorMinCutoff")
+                m_config.eye_anchor_min_cutoff = (float)std::atof(value.c_str());
+            else if (key == "EyeAnchorBeta")
+                m_config.eye_anchor_beta = (float)std::atof(value.c_str());
+            else if (key == "EyeFreezeInAir")
+                m_config.eye_freeze_in_air = std::atoi(value.c_str()) != 0;
             else if (key == "EyeSwayLimit")
                 m_config.eye_sway_limit = (float)std::atof(value.c_str());
             else if (key == "LogEvery")      m_config.log_every = std::atoi(value.c_str());
