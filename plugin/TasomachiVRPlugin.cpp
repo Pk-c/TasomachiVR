@@ -31,8 +31,6 @@
 #include <uevr/Plugin.hpp>
 
 #include "body.hpp"
-#include "eye.hpp"
-#include "roomscale.hpp"
 #include "settings.hpp"
 #include "ucall.hpp"
 #include "vrpage.hpp"
@@ -52,8 +50,6 @@ using API = uevr::API;
 namespace uc = tasomachivr::ucall;
 
 using tasomachivr::Body;
-using tasomachivr::Eye;
-using tasomachivr::Roomscale;
 using tasomachivr::MenuSettings;
 using tasomachivr::VrPage;
 
@@ -145,13 +141,6 @@ struct Config {
 
     // The eye follows the head bone, filtered. See eye.hpp for why the filter needs a
     // hard clamp as well as a low-pass.
-    bool  eye_stabilise  = true;
-    float eye_bob_damping = 9.0f;
-    float eye_sway_damping = 22.0f;
-    float eye_sway_limit = 4.0f;
-    // The body walks itself under the headset. On foot only - the flying boat is a pawn
-    // too, and displacing it would sail the boat with the player's footsteps.
-    // Off: the game's own layout, left stick moves and right stick turns.
     bool  swap_sticks    = false;
     // 0 = leave it alone, 1 = X, 2 = Y, 3 = A, 4 = B.
     int   interact_button = 4;
@@ -160,16 +149,8 @@ struct Config {
     std::string hud_counters;
     float hud_counter_fade = 8.0f;
     bool  hud_always_on  = false;
-    bool  roomscale      = true;
-    float roomscale_max_step = 25.0f;
-    float roomscale_speed = 8.0f;   // higher catches up faster
-    int   roomscale_yaw_source = 0;
-    int   roomscale_compensate = 1;
 
-    float eye_anchor_min_cutoff = 0.5f;
-    float eye_anchor_beta = 0.10f;
-    bool  eye_freeze_in_air = true;
-    float eye_air_lift = 30.0f;
+    float eye_air_lift = 18.0f;
     float eye_air_lift_speed = 12.0f;
 
     int   log_every      = 240;    // frames between diagnostic lines
@@ -496,23 +477,22 @@ public:
             return;
         }
 
-        drive_eye(delta);
-
-        // Only on foot, and only while the character is the one being framed: the boat is a
-        // pawn as well, and stepping sideways must not sail it.
-        Roomscale::Settings roomscale{};
-        roomscale.max_step = m_config.roomscale_max_step;
-        roomscale.yaw_source = m_config.roomscale_yaw_source;
-        roomscale.compensate = m_config.roomscale_compensate;
-        // Per-second rate turned into a per-frame fraction, so the easing does not depend on
-        // the frame rate.
+        // MovementMode is a TEnumAsByte - a whole byte, not a bitfield, so reading it is
+        // safe. EMovementMode: 1 = Walking, 3 = Falling.
+        bool airborne = false;
+        if (m_cmc != nullptr) {
+            if (auto* mode = m_cmc->get_property_data<uint8_t>(L"MovementMode")) {
+                airborne = (*mode == 3);
+            }
+        }
         {
             const float dt = delta > 0.0f ? delta : 0.016f;
-            float g = dt * m_config.roomscale_speed;
-            roomscale.gain = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
+            float k = dt * m_config.eye_air_lift_speed;
+            k = k < 0.0f ? 0.0f : (k > 1.0f ? 1.0f : k);
+            const float target = airborne ? m_config.eye_air_lift : 0.0f;
+            m_air_lift_now.store(m_air_lift_now.load() +
+                                 (target - m_air_lift_now.load()) * k);
         }
-        m_roomscale.update(m_pawn, m_config.roomscale && m_is_character, m_snap_yaw.load(),
-                           m_final_yaw.load(), roomscale);
 
         if (++m_frames >= m_config.log_every) {
             m_frames = 0;
@@ -707,16 +687,16 @@ public:
             return;
         }
 
-        // Position and rotation are written in the same place now. The Lua script used to
-        // own the position, which meant two callbacks racing to write the same struct.
-        if (position != nullptr) {
-            float eye[3]{};
-            if (m_eye.apply(eye)) {
-                position->x = eye[0];
-                position->y = eye[1];
-                position->z = eye[2];
-            }
-        }
+        // THE CAMERA POSITION IS LEFT TO UEVR, which is what makes its roomscale and its
+        // wall collision work. Writing it here - from the character's head bone - is what let
+        // the head pass through walls, and no trace could have fixed that: teleporting the
+        // camera bypasses collision by construction.
+        //
+        // This is the shape EuropaVR always had. Everything built to discipline that position
+        // - a one-euro anchor filter, an airborne freeze, a sphere trace, our own roomscale -
+        // existed only to make a value behave that we should never have been writing, and all
+        // of it is gone. The eye is placed by the offsets in the post callback instead.
+        (void)position;
 
         if (rotation == nullptr || !m_config.write_view_rot) {
             return;
@@ -744,36 +724,18 @@ public:
         const float r = m_final_yaw.load() * kDegToRad;
         position->x += std::cos(r) * m_config.forward_offset;
         position->y += std::sin(r) * m_config.forward_offset;
-        position->z += m_config.up_offset;
+
+        // Raised while airborne, eased both ways. The jump animation tucks the character up,
+        // and knees and chest rise into a viewpoint that is otherwise perfectly placed - this
+        // passes over them. It is cosmetic and makes no pretence otherwise.
+        //
+        // Applied HERE now, on the offset that places the eye, rather than to a camera
+        // position of our own: UEVR owns that position, which is what makes its roomscale and
+        // its wall collision work.
+        position->z += m_config.up_offset + m_air_lift_now.load();
     }
 
 private:
-    void drive_eye(float delta) {
-        Eye::Settings settings{};
-        settings.stabilise = m_config.eye_stabilise;
-        settings.bob_damping = m_config.eye_bob_damping;
-        settings.sway_damping = m_config.eye_sway_damping;
-        settings.sway_limit = m_config.eye_sway_limit;
-        settings.anchor_min_cutoff = m_config.eye_anchor_min_cutoff;
-        settings.anchor_beta = m_config.eye_anchor_beta;
-        settings.air_lift = m_config.eye_air_lift;
-        settings.air_lift_speed = m_config.eye_air_lift_speed;
-
-        // MovementMode is a TEnumAsByte - a whole byte, not a bitfield, so reading it is
-        // safe. EMovementMode: 1 = Walking, 3 = Falling. Only a Character has one.
-        settings.airborne = false;
-        if (m_config.eye_freeze_in_air && m_cmc != nullptr) {
-            if (auto* mode = m_cmc->get_property_data<uint8_t>(L"MovementMode")) {
-                settings.airborne = (*mode == 3);
-            }
-        }
-
-        auto* mesh = deref_object(m_pawn, L"Mesh");
-        if (mesh == nullptr) {
-            mesh = deref_object(m_pawn, L"SK_Pc_01");
-        }
-        m_eye.update(m_pawn, mesh, delta, m_gameplay.load(), settings);
-    }
 
     // Copies the page-editable settings out of the live config, lets the page work on
     // them, and copies back. Going through a separate struct keeps the loader-side
@@ -1480,12 +1442,6 @@ private:
             else if (key == "GraftPauseMenu")
                 m_config.graft_pause_menu = std::atoi(value.c_str()) != 0;
             else if (key == "BodyMode")      m_config.body_mode = std::atoi(value.c_str());
-            else if (key == "EyeStabilise")
-                m_config.eye_stabilise = std::atoi(value.c_str()) != 0;
-            else if (key == "EyeBobDamping")
-                m_config.eye_bob_damping = (float)std::atof(value.c_str());
-            else if (key == "EyeSwayDamping")
-                m_config.eye_sway_damping = (float)std::atof(value.c_str());
             else if (key == "SwapSticks")    m_config.swap_sticks = std::atoi(value.c_str()) != 0;
             else if (key == "InteractButton") m_config.interact_button = std::atoi(value.c_str());
             else if (key == "HudProbe")      m_config.hud_probe = std::atoi(value.c_str()) != 0;
@@ -1493,27 +1449,10 @@ private:
             else if (key == "HudCounterFade")
                 m_config.hud_counter_fade = (float)std::atof(value.c_str());
             else if (key == "HudAlwaysOn")   m_config.hud_always_on = std::atoi(value.c_str()) != 0;
-            else if (key == "Roomscale")     m_config.roomscale = std::atoi(value.c_str()) != 0;
-            else if (key == "RoomscaleSpeed")
-                m_config.roomscale_speed = (float)std::atof(value.c_str());
-            else if (key == "RoomscaleMaxStep")
-                m_config.roomscale_max_step = (float)std::atof(value.c_str());
-            else if (key == "RoomscaleYawSource")
-                m_config.roomscale_yaw_source = std::atoi(value.c_str());
-            else if (key == "RoomscaleCompensate")
-                m_config.roomscale_compensate = std::atoi(value.c_str());
-            else if (key == "EyeAnchorMinCutoff")
-                m_config.eye_anchor_min_cutoff = (float)std::atof(value.c_str());
-            else if (key == "EyeAnchorBeta")
-                m_config.eye_anchor_beta = (float)std::atof(value.c_str());
             else if (key == "EyeAirLift")
                 m_config.eye_air_lift = (float)std::atof(value.c_str());
             else if (key == "EyeAirLiftSpeed")
                 m_config.eye_air_lift_speed = (float)std::atof(value.c_str());
-            else if (key == "EyeFreezeInAir")
-                m_config.eye_freeze_in_air = std::atoi(value.c_str()) != 0;
-            else if (key == "EyeSwayLimit")
-                m_config.eye_sway_limit = (float)std::atof(value.c_str());
             else if (key == "LogEvery")      m_config.log_every = std::atoi(value.c_str());
         }
     }
@@ -1521,8 +1460,6 @@ private:
     Config m_config{};
 
     Body      m_body{};
-    Eye       m_eye{};
-    Roomscale m_roomscale{};
     VrPage m_vrpage{};
     float  m_widget_time{0.0f};
 
@@ -1531,6 +1468,7 @@ private:
     std::atomic<float> m_turn_axis{0.0f};
     std::atomic<float> m_quat_yaw{0.0f};
     // Cancels the anchor rotation for the view and the body, and for nothing else.
+    std::atomic<float> m_air_lift_now{0.0f};
     std::atomic<float> m_anchor_trim{0.0f};
     std::atomic<float> m_final_yaw{0.0f};
     // The yaw actually written to the pawn, held still while the headset only jitters.

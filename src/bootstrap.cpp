@@ -338,6 +338,12 @@ void place_ui_in_front() {
     // one too many.
     set_config_value(config, "UI_FollowView", "false");
 
+    // UEVR's OWN roomscale, which moves the player by sweeping the capsule - so walls stop
+    // you, and your head cannot be pushed through geometry. It only works while nothing
+    // overwrites the camera position afterwards, which is why the plugin no longer does.
+    set_config_value(config, "VR_RoomscaleMovement",
+                     setting_int(L"UevrRoomscale", 1) != 0 ? "true" : "false");
+
     // Metres from the eye, and the plane's size. Both are UEVR's, exposed here so they can
     // be dialled in from the same file as everything else.
     const auto distance = setting(L"MenuDistance", L"2.000000");

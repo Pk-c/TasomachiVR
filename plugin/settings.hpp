@@ -31,7 +31,7 @@ struct MenuSettings {
 
     // Centimetres the eye is raised while airborne. On the page because it is judged by eye,
     // in a headset, mid-jump - which is not something a number in a file can be tuned by.
-    float air_lift{30.0f};
+    float air_lift{18.0f};
 };
 
 } // namespace tasomachivr
