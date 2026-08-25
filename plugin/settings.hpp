@@ -22,7 +22,7 @@ struct MenuSettings {
     // How big UEVR draws the game's interface plane. On the page because it has to be found
     // by eye - too large and it runs past the edge of the headset's field of view, too small
     // and the text is unreadable, and where that line falls depends on the headset.
-    float menu_size{1.5f};
+    float menu_size{1.3f};
 };
 
 } // namespace tasomachivr

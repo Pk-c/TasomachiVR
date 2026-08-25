@@ -85,17 +85,12 @@ struct Config {
     // Which way to spin the anchor, and whether to hold the world still while
     // it spins. Both are conventions I could not settle by reading, so they are
     // settings with one obvious right answer to be found in one test.
-    float hud_axis_sign  = 1.0f;
-    float hud_compensate = 1.0f;
     // Hard ceiling on one correction, so a wrong axis cannot spin the session.
     float hud_max_turn   = 8.0f;
     float hud_follow_speed = 2.0f;
     float hud_release_angle = 6.0f;
-    bool  menu_face_on_open = false;
     // Seconds of head-following after a UI event, then it is released again.
-    float menu_follow_pulse = 0.35f;
-    float menu_reanchor_angle = 0.0f;
-    float menu_size      = 1.5f;
+    float menu_size      = 1.3f;
     float menu_distance  = 2.0f;
     float body_yaw_damping = 14.0f;   // higher follows faster
     float menu_deadzone = 0.75f;
@@ -253,109 +248,6 @@ public:
             drive_vr_page();
         }
         m_phase = 5;
-
-        // Moved here from the post tick, where it produced nothing at all across two
-        // builds even though it was correctly placed. The pre tick is wrapped in the
-        // structured-exception guard; the post tick is not, so a fault there is swallowed
-        // whole and everything after it is skipped in silence. That is exactly the failure
-        // that cost a day earlier, and this probe walking off a bad property is a very
-        // plausible way to trigger it.
-        //
-        // One-shot: which properties on the pawn hold a widget, so the HUD can be found the
-        // same way the pause menu was - by the variable the Blueprint keeps it in.
-        //
-        // The previous attempt produced no line at all, which means it stopped partway
-        // without saying so. Every step is guarded now and the line is written whatever
-        // happens, because a probe that can fail silently is worse than none: it looks like
-        // an answer.
-        // FIRST, and on its own, because it is the measurement the next decision rests on
-        // and it does not depend on the pawn at all. It used to sit after the property walk
-        // below - so when that walk faulted, the one number that mattered was never reached.
-        // A decisive measurement must not be placed behind a fragile one.
-        //
-        // Whether the game owns any WidgetComponent - a widget already living in the world -
-        // is the whole question for a 3D interface. The engine cannot be asked to make one:
-        // AddComponent only instantiates templates the Blueprint already holds,
-        // AddComponentByClass does not exist before 4.26, and RegisterComponent is not a
-        // UFUNCTION, so anything constructed here could never be registered and would never
-        // draw. Borrowing one that exists is what worked for the hands.
-        if (!m_wc_probed && m_gameplay.load()) {
-            m_wc_probed = true;
-            auto* wc_class = API::get()->find_uobject<API::UClass>(
-                L"Class /Script/UMG.WidgetComponent");
-            if (wc_class == nullptr) {
-                API::get()->log_info("[TasomachiVR] HUD PROBE | UMG.WidgetComponent class not "
-                                     "found - the module may not even be loaded");
-            } else {
-                const auto objects = wc_class->get_objects_matching<API::UObject>(false);
-                API::get()->log_info("[TasomachiVR] HUD PROBE | WidgetComponents alive = %d",
-                                     (int)objects.size());
-                int shown = 0;
-                for (auto* o : objects) {
-                    if (o == nullptr || shown >= 6) {
-                        break;
-                    }
-                    ++shown;
-                    API::get()->log_info("[TasomachiVR] HUD PROBE |   %s",
-                                         narrow(o->get_full_name()).c_str());
-                }
-            }
-        }
-
-        if (!m_hud_probed && m_gameplay.load() && m_pawn != nullptr) {
-            m_hud_probed = true;
-            std::string found;
-            int seen = 0;
-            auto* klass = m_pawn->get_class();
-            if (klass != nullptr) {
-                for (auto* f = klass->get_child_properties(); f != nullptr; f = f->get_next()) {
-                    ++seen;
-                    if (seen > 400) {
-                        break;   // a runaway list is a bug, not a reason to hang
-                    }
-                    auto* fname = f->get_fname();
-                    if (fname == nullptr) {
-                        continue;
-                    }
-                    // ONLY object properties. Reading every property as if it held a
-                    // pointer is what made this fault: for a float or an int it takes eight
-                    // arbitrary bytes, calls them an address and dereferences them. That is
-                    // the 0xC0000005 the guard reported, and it is why the same code logged
-                    // nothing at all from the post tick, where there was no guard to catch
-                    // it. The field's own class says what it is; asking is free.
-                    auto* fc = f->get_class();
-                    if (fc == nullptr) {
-                        continue;
-                    }
-                    const std::string kind = narrow(fc->get_name());
-                    if (kind != "ObjectProperty") {
-                        continue;
-                    }
-
-                    const auto wide = fname->to_string();
-                    auto* value = deref_object(m_pawn, wide.c_str());
-                    if (value == nullptr) {
-                        continue;
-                    }
-                    auto* vc = value->get_class();
-                    if (vc == nullptr || vc->get_fname() == nullptr) {
-                        continue;
-                    }
-                    const std::string cls = narrow(vc->get_fname()->to_string());
-                    if (cls.find("WBP") != std::string::npos ||
-                        cls.find("Widget") != std::string::npos ||
-                        cls.find("HUD") != std::string::npos) {
-                        found += " " + narrow(wide) + "=" + cls;
-                    }
-                }
-            }
-            API::get()->log_info("[TasomachiVR] HUD PROBE | pawn=%s properties=%d widgets:%s",
-                                 narrow(m_pawn_name).c_str(), seen,
-                                 found.empty() ? " none" : found.c_str());
-        }
-
-
-
     }
 
     // Same structured-exception guard as the pre tick, and for the same reason - it should
@@ -402,37 +294,7 @@ public:
         // facing the wrong way. Nothing is actually wrong with her; there is just no reason
         // to look at a body while reading a menu. She is put back, facing correctly, on the
         // way out, through the same cycle the Headless mode always runs on entry.
-        // THE MENU IS BROUGHT IN FRONT OF YOU WHEN IT OPENS, AND LEFT THERE.
-        //
-        // UEVR offers exactly two placements and neither is what is wanted: world-locked, so
-        // the panel sits wherever the snap yaw points and can end up behind you, or
-        // head-locked, which is glued to your face. Its option list has no follow speed, and
-        // its API does not expose the plane's transform, so a soft delayed follow is not on
-        // the table - that was checked in the binary rather than assumed.
-        //
-        // What IS available: in world-locked mode the panel is anchored to the view rotation
-        // this plugin writes, which is the snap-turn yaw. Turning that yaw to face you is
-        // just a snap turn, and the snap turn is machinery that already exists and that the
-        // rest of the mod already agrees with - the body follows it, roomscale maps through
-        // it. Nothing is out of step, unlike recenter_view(), which moved UEVR's own frame
-        // out from under the character and left her rotated ninety degrees.
-        //
-        // The world does swing round as the menu opens, by exactly the angle you had
-        // physically turned, and swings back when it closes. Behind a panel you are reading,
-        // with the body hidden anyway, that is a fair price for a menu that is always there.
         const bool menu_visible = m_vrpage.game_menu_visible();
-        if (m_config.menu_face_on_open && menu_visible != m_menu_was_visible) {
-            m_menu_was_visible = menu_visible;
-            if (menu_visible) {
-                // Where you are looking, relative to the anchor: the whole of the yaw that
-                // is not already in the snap.
-                m_snap_before_menu = m_snap_yaw.load();
-                const float delta = m_config.yaw_sign * m_quat_yaw.load() + m_config.yaw_offset;
-                m_snap_yaw.store(normalize_deg(m_snap_before_menu + delta));
-            } else {
-                m_snap_yaw.store(m_snap_before_menu);
-            }
-        }
 
         // UEVR's UI settings, driven LIVE rather than written into its config file at
         // startup. set_mod_value reaches the same settings its own menu edits, so the size
@@ -533,16 +395,20 @@ public:
                     // which is snap + yaw_sign * that same measured angle - gains
                     // -yaw_sign * step; adding it back to snap holds her, and the rendered
                     // view with her, perfectly still. Only the anchor moves.
-                    // Does the spin do what it is meant to? Measured in the same frame,
-                    // because three rounds of reasoning about this have all been wrong.
-                    // Spinning the offset by -step about the vertical should move the
-                    // measured angle by exactly -step. If it moves by something else, the
-                    // rotation axis is not the vertical in this quaternion convention, and
-                    // the "panic" is the extraction responding to a tilt rather than a turn.
                     const auto before = API::VR::get_rotation_offset();
-                    API::VR::set_rotation_offset(
-                        quat_mul(yaw_quat(-step * m_config.hud_axis_sign), before));
+                    API::VR::set_rotation_offset(quat_mul(yaw_quat(-step), before));
 
+                    // COMPENSATION, and it is not optional - without it the anchor takes the
+                    // view and the character round with it, so turning your head one way
+                    // sends her the other. It reaches only the view and the body; roomscale
+                    // keeps the bare snap yaw, because the trim cancels the offset and the
+                    // net mapping from tracking space to the world is unchanged.
+                    m_anchor_trim.store(normalize_deg(m_anchor_trim.load() - step));
+                    m_hud_turned += step;
+
+                    // Did the spin do what it was asked? Checked every step rather than
+                    // assumed: this is what tells a broken mechanism from a player who is
+                    // simply turning faster than the correction catches up.
                     const float after = hmd_quat_yaw();
                     const float moved = normalize_deg(after - drift);
                     if (std::fabs(moved + step) > 0.2f) {
@@ -550,119 +416,21 @@ public:
                     } else {
                         m_hud_broken = 0;
                     }
-                    if (m_hud_samples < 4) {
-                        ++m_hud_samples;
-                        API::get()->log_info("[TasomachiVR] HUD AXIS | asked %.2f | drift "
-                                             "%.2f -> %.2f (moved %.2f) | %s",
-                                             -step, drift, after, moved,
-                                             std::fabs(moved + step) < 0.2f ? "axis OK"
-                                                                            : "AXIS WRONG");
-                    }
-                    // Compensated through a DEDICATED term, not through the snap yaw.
-                    //
-                    // The snap yaw feeds three things: the view rotation, the character's
-                    // facing, and - the one that bit - the frame roomscale uses to turn your
-                    // physical steps into world movement. Spinning it during a correction
-                    // spun that frame too, so the body was walked around a rotating map while
-                    // the camera sat on its head. That is the "camera goes mad" part; the
-                    // anchor itself was arriving correctly all along.
-                    //
-                    // The trim reaches only the view and the body, which is exactly what has
-                    // to be held still. Roomscale keeps the bare snap yaw, and that is right
-                    // rather than merely convenient: the trim cancels the offset, so the net
-                    // rotation from tracking space to the world is unchanged, and the mapping
-                    // should not move.
-                    m_anchor_trim.store(normalize_deg(
-                        m_anchor_trim.load() - step * m_config.hud_compensate));
-                    m_hud_turned += step;
-
-                    if (!m_hud_logged) {
-                        m_hud_logged = true;
-                        API::get()->log_info("[TasomachiVR] HUD | first correction: drift "
-                                             "%.1f deg, step %.2f, axis_sign %.0f, "
-                                             "compensate %.0f", drift, step,
-                                             m_config.hud_axis_sign, m_config.hud_compensate);
-                    }
                 }
             } else {
                 m_hud_last_away = 0.0f;
             }
         }
 
-        // LAZY FOLLOW BY PULSING - OFF, because it rests on an assumption that turned out
-        // to be wrong, and the code is kept only so the reasoning is not lost.
-        //
-        // It assumed that releasing UI_FollowView leaves the panel where it currently is.
-        // It does not: UEVR returns it to its ANCHOR, which is the view rotation this plugin
-        // writes. So the panel swung round to face the player and then travelled straight
-        // back a moment later. A panel cannot be left somewhere by pulsing the follow flag,
-        // and no amount of tuning the threshold or the pulse length changes that.
-        //
-        // What is left is the anchor itself - see MenuFaceOnOpen below, which turns it with
-        // a snap turn instead of trying to park the panel away from it.
-        //
-        // A threshold, not a timer. While the panel is released it stays at the heading it
-        // was last put at, and the only question worth asking is how far your gaze has since
-        // drifted from it. Under the threshold, nothing happens and the panel is genuinely
-        // stationary - you can glance around it, lean, look down. Past it, following is
-        // switched on just long enough for UEVR to swing the panel round, then released
-        // again so it settles at the new heading.
-        //
-        // This is what "follow with a small delay" actually wants, and it is reachable now
-        // only because UEVR's settings turned out to be writable at runtime through
-        // set_mod_value. The alternative - a real 3D panel we place ourselves - is closed:
-        // the game owns no WidgetComponent to borrow, and one cannot be made here, since
-        // AddComponent only instantiates the Blueprint's own templates, AddComponentByClass
-        // does not exist before 4.26, and RegisterComponent is not reflected at all.
-        //
-        // Yaw only. Vertical drift is small in practice and adding pitch would re-anchor the
-        // panel every time you looked at your feet, which is the opposite of restful.
-        if (menu_visible && !m_menu_was_visible_ui) {
-            m_ui_pulse = m_config.menu_follow_pulse;   // the pause menu is a UI event too
-        }
-        m_menu_was_visible_ui = menu_visible;
-
-        // The HEADSET's own yaw, read here rather than taken from m_final_yaw, and read on
-        // every tick rather than only during gameplay. Two corrections in one:
-        //
-        //   m_final_yaw is only refreshed inside the gameplay branch, so on the title
-        //   screen, in cutscenes and in menus it is a frozen value and the drift below could
-        //   never grow - the lazy follow simply did not exist outside gameplay, which is
-        //   precisely where a menu panel matters most.
-        //
-        //   m_final_yaw also carries the snap-turn yaw, and the panel is anchored in that
-        //   same frame - a snap turn takes the panel round with you and opens no gap at all.
-        //   Counting it as drift would re-anchor for a turn that changed nothing.
-        //
-        // What is left is the headset yaw alone, which is exactly the angle between where
-        // the panel sits and where you are looking.
-        const float look = hmd_quat_yaw();
-        if (m_ui_pulse <= 0.0f && m_config.menu_reanchor_angle > 0.0f) {
-            if (!m_ui_anchored) {
-                m_ui_anchored = true;
-                m_ui_anchor_yaw = look;
-            } else if (std::fabs(normalize_deg(look - m_ui_anchor_yaw)) >
-                       m_config.menu_reanchor_angle) {
-                m_ui_pulse = m_config.menu_follow_pulse;
-            }
-        }
-
-        const bool follow = m_ui_pulse > 0.0f;
-        if (m_ui_pulse > 0.0f) {
-            m_ui_pulse -= delta;
-            // Kept current while it follows, so the moment it is released becomes the new
-            // resting heading.
-            m_ui_anchor_yaw = look;
-        }
-        // Written once unconditionally before trusting the cached value. Caching what we
-        // last SET is only valid if nothing else sets it, and the loader used to as well -
-        // so the plugin believed following was off while UEVR had it on, and never wrote
-        // anything to fix it because there was no change to react to.
-        if (!m_ui_follow_forced || follow != m_ui_follow_applied) {
+        // UI_FollowView stays OFF for good: the panel is placed by moving its anchor, not
+        // by letting it chase the view. Written once rather than on change, because the
+        // loader used to set it too and a cache of "what I last wrote" is only valid when
+        // nothing else writes.
+        if (!m_ui_follow_forced) {
             m_ui_follow_forced = true;
-            m_ui_follow_applied = follow;
-            API::VR::set_mod_value("UI_FollowView", follow);
+            API::VR::set_mod_value("UI_FollowView", false);
         }
+
         if (m_config.menu_size != m_ui_size_applied) {
             m_ui_size_applied = m_config.menu_size;
             API::VR::set_mod_value("UI_Size", m_config.menu_size);
@@ -1227,51 +995,6 @@ private:
             m_control_ok = m_control_rotation != nullptr;
         }
 
-        // WHO ELSE IS WRITING THIS? Read back before overwriting and compare with what was
-        // left here last frame. If the game's own camera logic is also driving
-        // ControlRotation, the pawn alternates between two yaws every frame and that reads
-        // as a fast shiver - and it would only show when the two disagree, which is exactly
-        // what "it trembles if I looked around during the cutscene, and not if I stayed
-        // still" describes.
-        if (m_control_rotation != nullptr) {
-            if (m_wrote_yaw) {
-                const float drift =
-                    std::fabs(normalize_deg(m_control_rotation->yaw - m_last_written_yaw));
-                if (drift > m_worst_drift) {
-                    m_worst_drift = drift;
-                }
-            }
-            // OUR OWN signal, which the drift figure above cannot see: we are the only
-            // writer, so a yaw that shakes because WE computed it that way reads as zero
-            // drift and still shakes the body. Measuring someone else's writes and calling
-            // that "is the yaw steady" was the wrong question.
-            //   want  worst per-frame change in the value we intend to write
-            //   quat  worst per-frame change in the raw headset yaw it comes from
-            // If quat is quiet and want is not, the noise is made between the two.
-            const float want = m_final_yaw.load();
-            const float q = m_quat_yaw.load();
-            if (m_wrote_yaw) {
-                const float dw = std::fabs(normalize_deg(want - m_prev_want));
-                if (dw > m_worst_want) {
-                    m_worst_want = dw;
-                }
-                const float dq = std::fabs(normalize_deg(q - m_prev_quat));
-                if (dq > m_worst_quat) {
-                    m_worst_quat = dq;
-                }
-            }
-            m_prev_want = want;
-            m_prev_quat = q;
-
-            if (++m_drift_frames >= 120) {
-                API::get()->log_info("[TasomachiVR] YAW | worst per frame: want=%.3f quat=%.3f "
-                                     "| others moved it %.2f deg",
-                                     m_worst_want, m_worst_quat, m_worst_drift);
-                m_drift_frames = 0;
-                m_worst_drift = m_worst_want = m_worst_quat = 0.0f;
-            }
-        }
-
         if (m_control_rotation != nullptr) {
 
             // Pitch stays flat: tipping the character because the player looked up is
@@ -1298,8 +1021,6 @@ private:
             m_control_rotation->pitch = 0.0f;
             m_control_rotation->yaw = m_applied_yaw;
             m_control_rotation->roll = 0.0f;
-            m_last_written_yaw = m_control_rotation->yaw;
-            m_wrote_yaw = true;
         }
 
         if (m_pawn == nullptr) {
@@ -1483,10 +1204,6 @@ private:
             else if (key == "ApplyBodyYaw")  m_config.apply_body_yaw = std::atoi(value.c_str()) != 0;
             else if (key == "BodyYawDamping")
                 m_config.body_yaw_damping = (float)std::atof(value.c_str());
-            else if (key == "MenuFollowPulse")
-                m_config.menu_follow_pulse = (float)std::atof(value.c_str());
-            else if (key == "MenuReanchorAngle")
-                m_config.menu_reanchor_angle = (float)std::atof(value.c_str());
             else if (key == "MenuSize")     m_config.menu_size = (float)std::atof(value.c_str());
             else if (key == "MenuDistance") m_config.menu_distance = (float)std::atof(value.c_str());
             else if (key == "HudFollowAngle")
@@ -1495,16 +1212,10 @@ private:
                 m_config.hud_follow_speed = (float)std::atof(value.c_str());
             else if (key == "HudReleaseAngle")
                 m_config.hud_release_angle = (float)std::atof(value.c_str());
-            else if (key == "HudAxisSign")
-                m_config.hud_axis_sign = (float)std::atof(value.c_str());
-            else if (key == "HudCompensate")
-                m_config.hud_compensate = (float)std::atof(value.c_str());
             else if (key == "HudMaxTurn")
                 m_config.hud_max_turn = (float)std::atof(value.c_str());
             else if (key == "ApplyRotationOffset")
                 m_config.apply_rotation_offset = std::atoi(value.c_str()) != 0;
-            else if (key == "MenuFaceOnOpen")
-                m_config.menu_face_on_open = std::atoi(value.c_str()) != 0;
             else if (key == "MenuRecenter") m_config.menu_recenter = std::atoi(value.c_str()) != 0;
             else if (key == "MenuDeadzone")  m_config.menu_deadzone = (float)std::atof(value.c_str());
             else if (key == "MenuAxisRatio") m_config.menu_axis_ratio = (float)std::atof(value.c_str());
@@ -1564,14 +1275,6 @@ private:
     std::atomic<float> m_snap_yaw{0.0f};
     std::atomic<float> m_turn_axis{0.0f};
     std::atomic<float> m_quat_yaw{0.0f};
-    float m_last_written_yaw{0.0f};
-    float m_worst_drift{0.0f};
-    float m_prev_want{0.0f};
-    float m_prev_quat{0.0f};
-    float m_worst_want{0.0f};
-    float m_worst_quat{0.0f};
-    int   m_drift_frames{0};
-    bool  m_wrote_yaw{false};
     // Cancels the anchor rotation for the view and the body, and for nothing else.
     std::atomic<float> m_anchor_trim{0.0f};
     std::atomic<float> m_final_yaw{0.0f};
@@ -1588,14 +1291,7 @@ private:
     int  m_menu_axis{-1};
     bool m_recentred{false};
     bool m_menu_was_visible{false};
-    float m_snap_before_menu{0.0f};
-    bool  m_hud_probed{false};
-    bool  m_wc_probed{false};
     bool  m_post_faulted{false};
-    bool  m_menu_was_visible_ui{false};
-    float m_ui_pulse{0.0f};
-    float m_ui_anchor_yaw{0.0f};
-    bool  m_ui_anchored{false};
     bool  m_ui_follow_applied{false};
     bool  m_ui_follow_forced{false};
     bool  m_hud_easing{false};
@@ -1604,9 +1300,6 @@ private:
     float m_hud_start_away{0.0f};
     int   m_hud_broken{0};
     float m_hud_elapsed{0.0f};
-    bool  m_hud_logged{false};
-    int   m_hud_samples{0};
-    float m_before_step_yaw{0.0f};
     float m_ui_size_applied{-1.0f};
     std::chrono::steady_clock::time_point m_menu_last{};
     float m_applied_yaw{0.0f};
