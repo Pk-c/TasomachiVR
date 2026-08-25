@@ -75,6 +75,7 @@ private:
         YawTrim,
         ShowBody,
         MenuScale,
+        HudAlways,
         RowCount,
     };
 

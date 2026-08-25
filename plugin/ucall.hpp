@@ -248,6 +248,17 @@ inline bool call_two(API::UObject* object, const wchar_t* function, const A& a, 
     return true;
 }
 
+// UWidget::SetRenderOpacity - a real alpha on the widget and everything under it, which is
+// what makes a fade possible at all. Toggling visibility can only pop.
+inline bool set_opacity(API::UObject* widget, float alpha) {
+    Call call{widget, L"SetRenderOpacity"};
+    if (!call.ok || !put(call, 0, alpha)) {
+        return false;
+    }
+    widget->process_event(call.fn, call.bytes.data());
+    return true;
+}
+
 inline API::UObject* child_at(API::UObject* panel, int32_t index) {
     Call call{panel, L"GetChildAt"};
     if (!call.ok || !put(call, 0, index)) {

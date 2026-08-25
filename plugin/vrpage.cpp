@@ -355,6 +355,7 @@ bool VrPage::build(API::UObject* menu) {
         {YawTrim,     L"Yaw trim",     L"deg",  -20.0f,  20.0f, 1.0f,  false},
         {ShowBody,    L"Show body",    nullptr,   0.0f,   1.0f, 1.0f,  true},
         {MenuScale,   L"Menu size",    nullptr,   0.6f,   2.5f, 0.1f,  false},
+        {HudAlways,   L"HUD always on", nullptr,  0.0f,   1.0f, 1.0f,  true},
     };
 
     for (const auto& spec : layout) {
@@ -498,6 +499,7 @@ void VrPage::sync_from(const MenuSettings& live) {
 
     set_checkbox(m_rows[SmoothTurn].control, live.turn_mode == 1);
     set_checkbox(m_rows[ShowBody].control, live.body_mode == 1);
+    set_checkbox(m_rows[HudAlways].control, live.hud_always_on);
 }
 
 void VrPage::poll(MenuSettings& live) {
@@ -564,6 +566,10 @@ void VrPage::poll(MenuSettings& live) {
     auto& body = m_rows[ShowBody];
     refresh_label(body, 0.0f, has_focus(body.control));
     live.body_mode = checkbox_checked(body.control) ? 1 : 0;
+
+    auto& hud = m_rows[HudAlways];
+    refresh_label(hud, 0.0f, has_focus(hud.control));
+    live.hud_always_on = checkbox_checked(hud.control);
 }
 
 } // namespace tasomachivr

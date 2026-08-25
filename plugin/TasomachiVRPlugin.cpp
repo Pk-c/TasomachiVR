@@ -34,6 +34,7 @@
 #include "eye.hpp"
 #include "roomscale.hpp"
 #include "settings.hpp"
+#include "ucall.hpp"
 #include "vrpage.hpp"
 
 #include <atomic>
@@ -48,6 +49,8 @@
 #include <vector>
 
 using API = uevr::API;
+namespace uc = tasomachivr::ucall;
+
 using tasomachivr::Body;
 using tasomachivr::Eye;
 using tasomachivr::Roomscale;
@@ -150,6 +153,13 @@ struct Config {
     // too, and displacing it would sail the boat with the player's footsteps.
     // Off: the game's own layout, left stick moves and right stick turns.
     bool  swap_sticks    = false;
+    // 0 = leave it alone, 1 = X, 2 = Y, 3 = A, 4 = B.
+    int   interact_button = 4;
+    bool  hud_probe      = true;   // one-shot listing of the HUD tree
+    // Widget names to fade, and how fast. Empty means the feature is off.
+    std::string hud_counters;
+    float hud_counter_fade = 8.0f;
+    bool  hud_always_on  = false;
     bool  roomscale      = true;
     float roomscale_max_step = 25.0f;
     float roomscale_speed = 8.0f;   // higher catches up faster
@@ -247,7 +257,47 @@ public:
         if (!m_phase_disabled[4]) {
             drive_vr_page();
         }
+        // One-shot: find the game's HUD and list its widget tree, so the two counters can
+        // be named rather than guessed at. Off unless HudProbe is set, and it walks children
+        // through GetChildrenCount/GetChildAt - reflected calls, not raw property reads,
+        // which is what made an earlier probe fault.
         m_phase = 5;
+        if (m_config.hud_probe && !m_hud_listed && m_gameplay.load() && !m_phase_disabled[5]) {
+            auto* klass = API::get()->find_uobject<API::UClass>(
+                L"WidgetBlueprintGeneratedClass /Game/ThirdPersonBP/Blueprints/"
+                L"WBP_HUD.WBP_HUD_C");
+            if (klass != nullptr) {
+                const auto found = klass->get_objects_matching<API::UObject>(false);
+                for (auto* hud : found) {
+                    if (hud == nullptr) {
+                        continue;
+                    }
+                    const auto full = narrow(hud->get_full_name());
+                    if (full.find("WidgetArchetype") != std::string::npos ||
+                        full.find("Default__") != std::string::npos) {
+                        continue;   // the template, not the widget on screen
+                    }
+                    m_hud_listed = true;
+                    API::get()->log_info("[TasomachiVR] HUDTREE | %s",
+                                         narrow(hud->get_full_name()).c_str());
+                    if (auto* tree = deref_object(hud, L"WidgetTree")) {
+                        if (auto* root = deref_object(tree, L"RootWidget")) {
+                            list_widgets(root, 0);
+                        }
+                    }
+                    break;
+                }
+            }
+            if (!m_hud_listed) {
+                API::get()->log_info("[TasomachiVR] HUDTREE | no live WBP_HUD_C found");
+                m_hud_listed = true;
+            }
+        }
+
+        m_phase = 6;
+        if (!m_phase_disabled[6]) {
+            drive_counters(delta);
+        }
     }
 
     // Same structured-exception guard as the pre tick, and for the same reason - it should
@@ -530,6 +580,25 @@ public:
             filter_menu_stick(state);
         }
 
+        // INTERACT MOVED TO A BUTTON OF YOUR CHOOSING.
+        //
+        // The game binds Interact to Gamepad_FaceButton_Right, and whichever physical button
+        // the VR runtime happens to map onto that is not something the game or this mod
+        // decides - in practice it arrives on X, which is an awkward place for the one
+        // button you press constantly.
+        //
+        // Rather than guess at XInput bits, the four face buttons are read as named VR
+        // actions - UEVR exposes AButtonLeft/BButtonLeft/AButtonRight/BButtonRight, which on
+        // a Touch are X, Y, A and B. The incoming FaceButton_Right bit is cleared and then
+        // re-raised only from the chosen one, so Interact leaves wherever it was and appears
+        // exactly where you asked.
+        if (user_index == 0 && m_config.interact_button != 0) {
+            state->Gamepad.wButtons &= ~XINPUT_GAMEPAD_B;
+            if (interact_held()) {
+                state->Gamepad.wButtons |= XINPUT_GAMEPAD_B;
+            }
+        }
+
         if (user_index == 0 && pause_button_held()) {
             state->Gamepad.wButtons |= XINPUT_GAMEPAD_START;
 
@@ -722,6 +791,7 @@ private:
         s.pause_button   = m_config.pause_button;
         s.body_mode      = m_config.body_mode;
         s.menu_size      = m_config.menu_size;
+        s.hud_always_on  = m_config.hud_always_on;
 
         // The page only writes while it is open, so the ini still governs the rest of
         // the time.
@@ -735,6 +805,7 @@ private:
         m_config.yaw_offset     = s.yaw_offset;
         m_config.body_mode      = s.body_mode;
         m_config.menu_size      = s.menu_size;
+        m_config.hud_always_on  = s.hud_always_on;
 
         // Closing the page is when the player is done choosing, so that is when the choices
         // are written. Saving every tick would rewrite the file while a slider is dragged.
@@ -843,6 +914,165 @@ private:
     // True while the chosen VR button is held. Action paths come from UEVR's own
     // manifest; the handle is resolved once, since a bad path would otherwise be
     // retried on every poll and stay invisible.
+    // The chosen face button, read straight from the VR runtime.
+    // Names and classes, indented by depth. Bounded on both depth and count: a widget tree
+    // is a tree, and a probe that can run away is worse than none.
+    void list_widgets(API::UObject* widget, int depth) {
+        if (widget == nullptr || depth > 6 || ++m_hud_lines > 120) {
+            return;
+        }
+        std::string pad(static_cast<size_t>(depth) * 2, ' ');
+        auto* wc = widget->get_class();
+        API::get()->log_info("[TasomachiVR] HUDTREE | %s%s : %s", pad.c_str(),
+                             narrow(widget->get_fname()->to_string()).c_str(),
+                             wc != nullptr && wc->get_fname() != nullptr
+                                 ? narrow(wc->get_fname()->to_string()).c_str() : "?");
+
+        uc::Call count{widget, L"GetChildrenCount"};
+        if (!count.ok) {
+            return;   // not a panel, so it has no children
+        }
+        widget->process_event(count.fn, count.bytes.data());
+        int32_t n = 0;
+        uc::result(count, n);
+        for (int32_t i = 0; i < n && i < 40; ++i) {
+            list_widgets(uc::child_at(widget, i), depth + 1);
+        }
+    }
+
+    // Collects the named widgets out of the HUD's tree, once.
+    void find_counters(API::UObject* widget, int depth) {
+        if (widget == nullptr || depth > 6 || m_counters.size() >= 8) {
+            return;
+        }
+        const auto name = narrow(widget->get_fname()->to_string());
+        if (m_config.hud_counters.find(name) != std::string::npos) {
+            m_counters.push_back(widget);
+            API::get()->log_info("[TasomachiVR] HUD | counter found: %s", name.c_str());
+        }
+
+        uc::Call count{widget, L"GetChildrenCount"};
+        if (!count.ok) {
+            return;
+        }
+        widget->process_event(count.fn, count.bytes.data());
+        int32_t n = 0;
+        uc::result(count, n);
+        for (int32_t i = 0; i < n && i < 40; ++i) {
+            find_counters(uc::child_at(widget, i), depth + 1);
+        }
+    }
+
+    // The counters are hidden until you ask for them, and FADE rather than pop.
+    //
+    // Held on the LEFT TRIGGER, which the game binds to CamZoomOUT - a zoom for the third
+    // person camera this mod removed, so it is genuinely free. The left grip would have done
+    // too, but it carries CamReset, which still reaches the spring arm the script collapses
+    // every frame.
+    //
+    // SetRenderOpacity rather than visibility: visibility can only pop, and it also changes
+    // hit testing and layout. Opacity is the one that can be eased.
+    void drive_counters(float delta) {
+        if (m_config.hud_counters.empty()) {
+            return;
+        }
+
+        if (!m_counters_found && m_gameplay.load()) {
+            auto* klass = API::get()->find_uobject<API::UClass>(
+                L"WidgetBlueprintGeneratedClass /Game/ThirdPersonBP/Blueprints/"
+                L"WBP_HUD.WBP_HUD_C");
+            if (klass != nullptr) {
+                // The LIVE widget, not the archetype. get_objects_matching hands back the
+                // Blueprint's template too - /Game/.../WBP_HUD.WidgetArchetype - and its
+                // tree has the same names, so it looks like a perfectly good answer while
+                // being the one object whose opacity nothing on screen reads.
+                for (auto* hud : klass->get_objects_matching<API::UObject>(false)) {
+                    if (hud == nullptr) {
+                        continue;
+                    }
+                    const auto full = narrow(hud->get_full_name());
+                    if (full.find("WidgetArchetype") != std::string::npos ||
+                        full.find("Default__") != std::string::npos) {
+                        continue;
+                    }
+                    API::get()->log_info("[TasomachiVR] HUD | live widget: %s", full.c_str());
+                    if (auto* tree = deref_object(hud, L"WidgetTree")) {
+                        if (auto* root = deref_object(tree, L"RootWidget")) {
+                            find_counters(root, 0);
+                        }
+                    }
+                    break;
+                }
+            }
+            m_counters_found = !m_counters.empty();
+        }
+        if (m_counters.empty()) {
+            return;
+        }
+
+        const float target = (m_config.hud_always_on || left_trigger_held())
+                                 ? 1.0f : 0.0f;
+        const float dt = delta > 0.0f ? delta : 0.016f;
+        float k = dt * m_config.hud_counter_fade;
+        k = k < 0.0f ? 0.0f : (k > 1.0f ? 1.0f : k);
+        m_counter_alpha += (target - m_counter_alpha) * k;
+
+        // Written only while it is actually changing, so a hidden HUD costs nothing.
+        if (std::fabs(m_counter_alpha - m_counter_shown) > 0.002f) {
+            m_counter_shown = m_counter_alpha;
+            for (auto* w : m_counters) {
+                uc::set_opacity(w, m_counter_alpha);
+            }
+        }
+    }
+
+    bool left_trigger_held() {
+        const auto* vr = API::get()->param()->vr;
+        if (vr == nullptr) {
+            return false;
+        }
+        if (!m_trigger_resolved) {
+            m_trigger_resolved = true;
+            m_trigger_action = vr->get_action_handle("/actions/default/in/Trigger");
+        }
+        if (m_trigger_action == nullptr) {
+            return false;
+        }
+        return vr->is_action_active(m_trigger_action, vr->get_left_joystick_source());
+    }
+
+    bool interact_held() {
+        const auto* vr = API::get()->param()->vr;
+        if (vr == nullptr) {
+            return false;
+        }
+
+        if (!m_interact_resolved) {
+            m_interact_resolved = true;
+            const char* path = nullptr;
+            switch (m_config.interact_button) {
+            case 1: path = "/actions/default/in/AButtonLeft";  m_interact_left = true;  break;
+            case 2: path = "/actions/default/in/BButtonLeft";  m_interact_left = true;  break;
+            case 3: path = "/actions/default/in/AButtonRight"; m_interact_left = false; break;
+            case 4: path = "/actions/default/in/BButtonRight"; m_interact_left = false; break;
+            default: return false;
+            }
+            m_interact_action = vr->get_action_handle(path);
+            if (m_interact_action == nullptr) {
+                API::get()->log_info("[TasomachiVR] interact action %s did not resolve", path);
+            } else {
+                API::get()->log_info("[TasomachiVR] Interact bound to %s", path);
+            }
+        }
+        if (m_interact_action == nullptr) {
+            return false;
+        }
+
+        const auto source = m_interact_left ? vr->get_left_joystick_source()
+                                            : vr->get_right_joystick_source();
+        return vr->is_action_active(m_interact_action, source);
+    }
+
     bool pause_button_held() {
         if (m_config.pause_button == 0) {
             return false;
@@ -1098,6 +1328,7 @@ private:
             {"YawOffset",       format_number(m_config.yaw_offset)},
             {"BodyMode",        std::to_string(m_config.body_mode)},
             {"MenuSize",        format_number(m_config.menu_size)},
+            {"HudAlwaysOn",     std::to_string(m_config.hud_always_on ? 1 : 0)},
         };
 
         const auto path = settings_path();
@@ -1242,6 +1473,12 @@ private:
             else if (key == "EyeSwayDamping")
                 m_config.eye_sway_damping = (float)std::atof(value.c_str());
             else if (key == "SwapSticks")    m_config.swap_sticks = std::atoi(value.c_str()) != 0;
+            else if (key == "InteractButton") m_config.interact_button = std::atoi(value.c_str());
+            else if (key == "HudProbe")      m_config.hud_probe = std::atoi(value.c_str()) != 0;
+            else if (key == "HudCounters")   m_config.hud_counters = value;
+            else if (key == "HudCounterFade")
+                m_config.hud_counter_fade = (float)std::atof(value.c_str());
+            else if (key == "HudAlwaysOn")   m_config.hud_always_on = std::atoi(value.c_str()) != 0;
             else if (key == "Roomscale")     m_config.roomscale = std::atoi(value.c_str()) != 0;
             else if (key == "RoomscaleSpeed")
                 m_config.roomscale_speed = (float)std::atof(value.c_str());
@@ -1305,6 +1542,17 @@ private:
     float m_applied_yaw{0.0f};
     bool  m_have_applied_yaw{false};
 
+    UEVR_ActionHandle m_interact_action{};
+    std::vector<API::UObject*> m_counters{};
+    bool  m_counters_found{false};
+    float m_counter_alpha{0.0f};
+    float m_counter_shown{-1.0f};
+    UEVR_ActionHandle m_trigger_action{};
+    bool  m_trigger_resolved{false};
+    bool m_hud_listed{false};
+    int  m_hud_lines{0};
+    bool m_interact_resolved{false};
+    bool m_interact_left{false};
     UEVR_ActionHandle m_pause_action{};
     bool m_pause_resolved{false};
     bool m_pause_ok{false};
