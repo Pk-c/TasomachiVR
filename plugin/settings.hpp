@@ -28,6 +28,10 @@ struct MenuSettings {
     // default: the point of the fade is a clear view, and this is the escape hatch for
     // moments when you would rather just read the numbers.
     bool  hud_always_on{false};
+
+    // Centimetres the eye is raised while airborne. On the page because it is judged by eye,
+    // in a headset, mid-jump - which is not something a number in a file can be tuned by.
+    float air_lift{30.0f};
 };
 
 } // namespace tasomachivr

@@ -44,6 +44,16 @@ public:
         // chest; that is pose, not head movement, and following it put the camera in the
         // torso. Frozen, the view rides the capsule, which is what a jump should feel like.
         bool  airborne{false};
+
+        // Centimetres the eye is raised while airborne, eased in and out.
+        //
+        // The camera is already in the right place during a jump - the anchor tracks the
+        // capsule exactly and the head offset is held - so what still comes into view is the
+        // ANIMATION: the character tucks, and knees and chest rise into a viewpoint that
+        // never moved. Lifting the eye passes over them. It is a cosmetic correction and
+        // makes no pretence otherwise; too much of it feels like floating.
+        float air_lift{0.0f};
+        float air_lift_speed{12.0f};
     };
 
     // Call once per tick with the mesh carrying the character. Does nothing useful until
@@ -65,6 +75,10 @@ private:
     float m_prev[3]{};
     float m_rate[3]{};
     bool  m_have_anchor{false};
+    bool  m_air_seen{false};
+    float m_lift{0.0f};
+    float m_air_drop{0.0f};
+    bool  m_was_air{false};
     bool  m_have_eye{false};
     bool  m_reported{false};
 };

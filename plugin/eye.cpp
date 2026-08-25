@@ -81,6 +81,22 @@ void Eye::update(API::UObject* pawn, API::UObject* mesh, float delta, bool gamep
                 m_prev[i] = raw[i];
                 m_rate[i] += (speed - m_rate[i]) * alpha(1.0f);
 
+                // AIRBORNE: no filtering at all, the anchor is taken exactly.
+                //
+                // A one-euro filter raises its cutoff with the measured speed, but that
+                // speed is itself smoothed - so at the START of a fast movement it has not
+                // noticed yet and is still filtering as if you were standing still. A jump
+                // is almost entirely start: by the time the filter has caught up you are on
+                // the way down. The anchor therefore lags upward, the body rises without the
+                // view, and the camera ends up inside the chest.
+                //
+                // Jitter simply does not matter for the half second of a jump, and lag very
+                // much does, so while your feet are off the ground the filter steps aside.
+                if (settings.airborne) {
+                    m_anchor[i] = raw[i];
+                    continue;
+                }
+
                 const float cutoff = settings.anchor_min_cutoff +
                                      settings.anchor_beta * std::fabs(m_rate[i]);
                 m_anchor[i] += (raw[i] - m_anchor[i]) * alpha(cutoff);
@@ -89,6 +105,15 @@ void Eye::update(API::UObject* pawn, API::UObject* mesh, float delta, bool gamep
         anchor = Vector{m_anchor[0], m_anchor[1], m_anchor[2]};
     } else {
         m_have_anchor = false;
+    }
+
+    // Reported once, because everything above depends on it and it is read through a byte
+    // property on a component that may not be there: a silent false would look exactly like
+    // a filter that is too slow.
+    if (settings.airborne && !m_air_seen) {
+        m_air_seen = true;
+        API::get()->log_info("[TasomachiVR] EYE | airborne detected - anchor unfiltered, "
+                             "head offset held");
     }
 
     const Vector offset{head.x - anchor.x, head.y - anchor.y, head.z - anchor.z};
@@ -117,14 +142,40 @@ void Eye::update(API::UObject* pawn, API::UObject* mesh, float delta, bool gamep
         m_off[2] = clampf(m_off[2], offset.z - limit, offset.z + limit);
     }
 
+    // MEASURED while you are in the air: how far the animation drops the head below where
+    // it was held. That number is what the lift has to clear, so it beats guessing at one.
+    if (settings.airborne) {
+        const float drop = m_off[2] - offset.z;   // frozen height minus where the head is now
+        if (drop > m_air_drop) {
+            m_air_drop = drop;
+        }
+        m_was_air = true;
+    } else if (m_was_air) {
+        m_was_air = false;
+        if (m_air_drop > 0.5f) {
+            API::get()->log_info("[TasomachiVR] EYE | that jump dropped the head %.1f cm "
+                                 "below the held position", m_air_drop);
+        }
+        m_air_drop = 0.0f;
+    }
+
+    // Eased both ways, so it neither pops on take-off nor snaps back on landing.
+    {
+        const float dt = delta > 0.0f ? delta : 0.016f;
+        float k = dt * settings.air_lift_speed;
+        k = k < 0.0f ? 0.0f : (k > 1.0f ? 1.0f : k);
+        const float target = settings.airborne ? settings.air_lift : 0.0f;
+        m_lift += (target - m_lift) * k;
+    }
+
     if (anchored) {
         m_eye[0] = anchor.x + m_off[0];
         m_eye[1] = anchor.y + m_off[1];
-        m_eye[2] = anchor.z + m_off[2];
+        m_eye[2] = anchor.z + m_off[2] + m_lift;
     } else {
         m_eye[0] = head.x;
         m_eye[1] = head.y;
-        m_eye[2] = head.z;
+        m_eye[2] = head.z + m_lift;
     }
 
 }

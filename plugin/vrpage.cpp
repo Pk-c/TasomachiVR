@@ -352,10 +352,10 @@ bool VrPage::build(API::UObject* menu) {
         {SmoothSpeed, L"Turn speed",   L"deg/s", 30.0f, 240.0f, 5.0f,  false},
         {EyeForward,  L"Eye forward",  L"cm",   -10.0f,  40.0f, 1.0f,  false},
         {EyeHeight,   L"Eye height",   L"cm",   -15.0f,  15.0f, 1.0f,  false},
-        {YawTrim,     L"Yaw trim",     L"deg",  -20.0f,  20.0f, 1.0f,  false},
         {ShowBody,    L"Show body",    nullptr,   0.0f,   1.0f, 1.0f,  true},
         {MenuScale,   L"Menu size",    nullptr,   0.6f,   2.5f, 0.1f,  false},
         {HudAlways,   L"HUD always on", nullptr,  0.0f,   1.0f, 1.0f,  true},
+        {AirLift,     L"Jump lift",    L"cm",     0.0f,  80.0f, 2.0f,  false},
     };
 
     for (const auto& spec : layout) {
@@ -494,12 +494,19 @@ void VrPage::sync_from(const MenuSettings& live) {
     push(SmoothSpeed, live.smooth_speed);
     push(EyeForward, live.forward_offset);
     push(EyeHeight, live.up_offset);
-    push(YawTrim, live.yaw_offset);
     push(MenuScale, live.menu_size);
+    push(AirLift, live.air_lift);
 
-    set_checkbox(m_rows[SmoothTurn].control, live.turn_mode == 1);
-    set_checkbox(m_rows[ShowBody].control, live.body_mode == 1);
-    set_checkbox(m_rows[HudAlways].control, live.hud_always_on);
+    // Recorded like the sliders. The checkboxes had no such protection: they were read
+    // unconditionally, so a freshly rebuilt one - the game builds a new pause menu every
+    // time it opens - could report its default and quietly turn a setting off.
+    const auto check = [this](RowId id, bool on) {
+        set_checkbox(m_rows[id].control, on);
+        m_rows[id].pushed = on ? 1.0f : 0.0f;
+    };
+    check(SmoothTurn, live.turn_mode == 1);
+    check(ShowBody, live.body_mode == 1);
+    check(HudAlways, live.hud_always_on);
 }
 
 void VrPage::poll(MenuSettings& live) {
@@ -508,6 +515,11 @@ void VrPage::poll(MenuSettings& live) {
     if (m_entry_was_pressed && !entry_pressed) {
         open_page(true);
         m_needs_sync = true;
+        m_entry_was_pressed = entry_pressed;
+        // Nothing is read on the tick the page opens. poll() used to carry on past this
+        // point and pull values out of widgets that sync_from had not reached yet - one
+        // frame of reading whatever they happened to hold, straight into the settings.
+        return;
     }
     m_entry_was_pressed = entry_pressed;
 
@@ -555,21 +567,26 @@ void VrPage::poll(MenuSettings& live) {
     live.smooth_speed = read(SmoothSpeed, live.smooth_speed);
     live.forward_offset = read(EyeForward, live.forward_offset);
     live.up_offset = read(EyeHeight, live.up_offset);
-    live.yaw_offset = read(YawTrim, live.yaw_offset);
     live.menu_size = read(MenuScale, live.menu_size);
+    live.air_lift = read(AirLift, live.air_lift);
 
     // The toggles carry no number, but they still want the focus marker.
-    auto& smooth = m_rows[SmoothTurn];
-    refresh_label(smooth, 0.0f, has_focus(smooth.control));
-    live.turn_mode = checkbox_checked(smooth.control) ? 1 : 0;
+    // Same rule as the sliders: only a box the player actually clicked may change a
+    // setting. One still holding what we put there is left alone.
+    const auto toggle = [this](RowId id, bool current) {
+        auto& row = m_rows[id];
+        refresh_label(row, 0.0f, has_focus(row.control));
+        const bool raw = checkbox_checked(row.control);
+        if (row.pushed < 0.0f || raw != (row.pushed > 0.5f)) {
+            row.pushed = raw ? 1.0f : 0.0f;
+            return raw;
+        }
+        return current;
+    };
 
-    auto& body = m_rows[ShowBody];
-    refresh_label(body, 0.0f, has_focus(body.control));
-    live.body_mode = checkbox_checked(body.control) ? 1 : 0;
-
-    auto& hud = m_rows[HudAlways];
-    refresh_label(hud, 0.0f, has_focus(hud.control));
-    live.hud_always_on = checkbox_checked(hud.control);
+    live.turn_mode = toggle(SmoothTurn, live.turn_mode == 1) ? 1 : 0;
+    live.body_mode = toggle(ShowBody, live.body_mode == 1) ? 1 : 0;
+    live.hud_always_on = toggle(HudAlways, live.hud_always_on);
 }
 
 } // namespace tasomachivr

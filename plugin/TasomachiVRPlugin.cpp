@@ -169,6 +169,8 @@ struct Config {
     float eye_anchor_min_cutoff = 0.5f;
     float eye_anchor_beta = 0.10f;
     bool  eye_freeze_in_air = true;
+    float eye_air_lift = 30.0f;
+    float eye_air_lift_speed = 12.0f;
 
     int   log_every      = 240;    // frames between diagnostic lines
 };
@@ -754,6 +756,8 @@ private:
         settings.sway_limit = m_config.eye_sway_limit;
         settings.anchor_min_cutoff = m_config.eye_anchor_min_cutoff;
         settings.anchor_beta = m_config.eye_anchor_beta;
+        settings.air_lift = m_config.eye_air_lift;
+        settings.air_lift_speed = m_config.eye_air_lift_speed;
 
         // MovementMode is a TEnumAsByte - a whole byte, not a bitfield, so reading it is
         // safe. EMovementMode: 1 = Walking, 3 = Falling. Only a Character has one.
@@ -792,6 +796,7 @@ private:
         s.body_mode      = m_config.body_mode;
         s.menu_size      = m_config.menu_size;
         s.hud_always_on  = m_config.hud_always_on;
+        s.air_lift       = m_config.eye_air_lift;
 
         // The page only writes while it is open, so the ini still governs the rest of
         // the time.
@@ -806,6 +811,7 @@ private:
         m_config.body_mode      = s.body_mode;
         m_config.menu_size      = s.menu_size;
         m_config.hud_always_on  = s.hud_always_on;
+        m_config.eye_air_lift   = s.air_lift;
 
         // Closing the page is when the player is done choosing, so that is when the choices
         // are written. Saving every tick would rewrite the file while a slider is dragged.
@@ -1329,6 +1335,7 @@ private:
             {"BodyMode",        std::to_string(m_config.body_mode)},
             {"MenuSize",        format_number(m_config.menu_size)},
             {"HudAlwaysOn",     std::to_string(m_config.hud_always_on ? 1 : 0)},
+            {"EyeAirLift",      format_number(m_config.eye_air_lift)},
         };
 
         const auto path = settings_path();
@@ -1396,6 +1403,13 @@ private:
             return;
         }
         m_config_stamp = stamp;
+
+        // Said out loud, because load_config() overwrites EVERY setting from the file - so
+        // any reload that fires after the player has changed something on the page silently
+        // undoes it. The page writes on close; if a reload lands between the change and the
+        // save, the change is gone and the slider "resets by itself".
+        API::get()->log_info("[TasomachiVR] config file changed - reloading (air lift was "
+                             "%.0f)", m_config.eye_air_lift);
 
         const Config before = m_config;
         load_config();
@@ -1492,6 +1506,10 @@ private:
                 m_config.eye_anchor_min_cutoff = (float)std::atof(value.c_str());
             else if (key == "EyeAnchorBeta")
                 m_config.eye_anchor_beta = (float)std::atof(value.c_str());
+            else if (key == "EyeAirLift")
+                m_config.eye_air_lift = (float)std::atof(value.c_str());
+            else if (key == "EyeAirLiftSpeed")
+                m_config.eye_air_lift_speed = (float)std::atof(value.c_str());
             else if (key == "EyeFreezeInAir")
                 m_config.eye_freeze_in_air = std::atoi(value.c_str()) != 0;
             else if (key == "EyeSwayLimit")
