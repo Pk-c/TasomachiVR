@@ -117,6 +117,7 @@ void Body::apply(API::UObject* pawn, int mode, bool gameplay) {
         m_mesh = find_head_mesh(pawn);
         m_asset = nullptr;
         m_applied = -2;
+        m_cycle_stage = 0;
 
         if (m_mesh != nullptr) {
             API::get()->log_info("[TasomachiVR] BODY | mesh %s on %s",
@@ -134,12 +135,34 @@ void Body::apply(API::UObject* pawn, int mode, bool gameplay) {
     if (asset != m_asset) {
         m_asset = asset;
         m_applied = -2;
+        m_cycle_stage = 0;
     }
 
     const int wanted = gameplay ? mode : -1;
     if (wanted == m_applied) {
         return;
     }
+
+    // ENTERING Headless goes the long way round: unhide the bone and drop the mesh out of
+    // the main pass for one tick, then hide the bone on the next.
+    //
+    // This is not a theory, it is the only sequence measured to work. Applying Headless
+    // directly leaves the head and the arms shivering; toggling BodyMode 1 -> 0 -> 1 by hand
+    // clears it every time, and the difference between those two is exactly the step below.
+    // An earlier version tied this to the animation rebuild, on the assumption that the
+    // rebuild was the trigger - that assumption came from a guess about cutscenes that has
+    // since been withdrawn, and the fix only ever fired by luck. Doing it on every entry
+    // does not depend on knowing the trigger at all.
+    //
+    // The cost is one frame with the body not drawn, at the moment gameplay begins.
+    if (wanted == Headless && m_cycle_stage == 0) {
+        m_cycle_stage = 1;
+        unhide_bone(m_mesh, kHeadBone);
+        render_in_main_pass(m_mesh, false);
+        API::get()->log_info("[TasomachiVR] BODY | cycling before headless");
+        return;   // m_applied is left alone, so this runs again next tick
+    }
+    m_cycle_stage = 0;
     m_applied = wanted;
 
     switch (wanted) {

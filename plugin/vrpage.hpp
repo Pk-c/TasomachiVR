@@ -36,6 +36,16 @@ public:
     // caller needs to know when that is.
     bool is_open() const { return m_open; }
 
+    // Whether the GAME's pause menu is on screen - not just our page inside it.
+    bool game_menu_visible() const;
+
+    // True once, after the page is closed. The caller uses it to persist the settings.
+    bool take_close_event() {
+        const bool v = m_closed;
+        m_closed = false;
+        return v;
+    }
+
 private:
     // One row: a label and a control, in a HorizontalBox. Sliders are always 0..1 and
     // mapped, so the engine side needs no range configuration.
@@ -48,6 +58,10 @@ private:
         float hi{1.0f};
         float step{1.0f};
         bool  is_toggle{false};
+        // The normalised value last pushed onto this widget. A widget still holding it has
+        // not been touched by the player and must NOT write back - that is how a freshly
+        // rebuilt slider used to overwrite a real setting with its own default.
+        float pushed{-1.0f};
         float shown{-99999.0f}; // last value written into the label
         bool  focused{false};   // last focus state written into the label
     };
@@ -60,6 +74,7 @@ private:
         EyeHeight,
         YawTrim,
         ShowBody,
+        MenuScale,
         RowCount,
     };
 
@@ -69,6 +84,7 @@ private:
     // each rewrite costs one leaked FText.
     void refresh_label(Row& row, float value, bool focused);
     void open_page(bool open);
+    void sync_from(const MenuSettings& live);
 
     uevr::API::UObject* m_menu{nullptr};      // the instance this UI belongs to
     uevr::API::UObject* m_main_box{nullptr};  // the game's main list, hidden while we show
@@ -81,6 +97,8 @@ private:
     Row m_rows[RowCount]{};
 
     bool m_open{false};
+    bool m_closed{false};
+    bool m_needs_sync{false};
     bool m_entry_was_pressed{false};
     bool m_back_was_pressed{false};
     bool m_logged{false};

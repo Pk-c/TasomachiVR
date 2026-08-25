@@ -311,6 +311,45 @@ void keep_uevr_menu_closed() {
     log("UEVR menu pinned closed at startup");
 }
 
+// Where UEVR puts the game's own 2D interface in the headset.
+//
+// By default UEVR pins that plane in the world, and this mod writes the game's view
+// rotation as the snap-turn yaw alone - the headset's rotation is added afterwards, for the
+// eyes only. So the pause menu appears where the snap yaw points, which after a physical
+// turn can be off to one side or squarely behind you.
+//
+// UI_FollowView makes the plane come to wherever you are looking, which is the fix, and it
+// is UEVR's own setting rather than anything this mod has to compute. It replaces an
+// earlier attempt that called recenter_view() when the menu opened: that turned the world
+// without turning the character, so she appeared to face sideways, and it redefined which
+// way is forward for roomscale - bodies ended up rotated ninety degrees. This touches the
+// view frame not at all.
+void place_ui_in_front() {
+    const auto config = profile_dir() / L"config.txt";
+    // Always FALSE here, and deliberately not a setting any more: the plugin owns this one
+    // and toggles it live through set_mod_value to do its lazy follow. All this does is put
+    // UEVR in a known state at launch, so the plugin's idea of the current value is right
+    // from the first frame.
+    //
+    // It used to be written from a MenuFollowsView key. That key was later replaced by
+    // MenuFollowPulse and this line was not updated, so the lookup missed, fell back to its
+    // default of 1, and pinned following ON at every launch - while the plugin, assuming it
+    // started off, never wrote anything to correct it. Two owners for one value, which is
+    // one too many.
+    set_config_value(config, "UI_FollowView", "false");
+
+    // Metres from the eye, and the plane's size. Both are UEVR's, exposed here so they can
+    // be dialled in from the same file as everything else.
+    const auto distance = setting(L"MenuDistance", L"2.000000");
+    const auto size = setting(L"MenuSize", L"2.000000");
+    std::string distance_narrow(distance.begin(), distance.end());
+    std::string size_narrow(size.begin(), size.end());
+    set_config_value(config, "UI_Distance", distance_narrow);
+    set_config_value(config, "UI_Size", size_narrow);
+    log("UI placement: follow=false (the plugin drives it) distance=%s size=%s",
+        distance_narrow.c_str(), size_narrow.c_str());
+}
+
 DWORD WINAPI bootstrap_thread(LPVOID) {
     log("=== TasomachiVR bootstrap (host=%ls, project=%ls) ===", host_exe_stem().c_str(),
         project_name().c_str());
@@ -348,6 +387,8 @@ DWORD WINAPI bootstrap_thread(LPVOID) {
         if (setting_int(L"StartWithMenuClosed", 1) != 0) {
             keep_uevr_menu_closed();
         }
+
+        place_ui_in_front();
     }
 
     wait_for_game_window(setting_int(L"WindowWaitTimeoutMs", 120000));

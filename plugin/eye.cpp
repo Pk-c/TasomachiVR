@@ -117,6 +117,50 @@ void Eye::update(API::UObject* pawn, API::UObject* mesh, float delta, bool gamep
         m_off[2] = clampf(m_off[2], offset.z - limit, offset.z + limit);
     }
 
+    // Reported once per second, because the same binary trembles on one launch and not on
+    // the next - so this is an initialisation that succeeds or fails by luck, not a filter
+    // that needs tuning. Everything that could differ between two runs is here:
+    //   anchored  0 means K2_GetComponentLocation failed and the code below falls back to
+    //             the raw head bone with NO filtering at all, which would tremble exactly
+    //             as described. This is the prime suspect.
+    //   raw/cam   worst single-frame movement of the unfiltered anchor and of the final
+    //             view. If raw is quiet and cam is not, the filter is at fault; if both are
+    //             loud, the input is.
+    //   dt        the frame time the filter is handed. A wrong or wildly varying dt makes
+    //             the smoothing coefficient meaningless.
+    {
+        const float dt = delta > 0.0f ? delta : 0.016f;
+        if (m_have_anchor) {
+            const float rdx = m_prev[0] - m_last_raw[0];
+            const float rdy = m_prev[1] - m_last_raw[1];
+            const float rdz = m_prev[2] - m_last_raw[2];
+            const float r = std::sqrt(rdx * rdx + rdy * rdy + rdz * rdz);
+            if (r > m_worst_raw) {
+                m_worst_raw = r;
+            }
+        }
+        m_last_raw[0] = m_prev[0];
+        m_last_raw[1] = m_prev[1];
+        m_last_raw[2] = m_prev[2];
+        if (dt < m_dt_min) { m_dt_min = dt; }
+        if (dt > m_dt_max) { m_dt_max = dt; }
+
+        m_probe_time += dt;
+        if (m_probe_time >= 1.0f) {
+            API::get()->log_info("[TasomachiVR] EYE | anchored=%d mesh=%s | worst frame: "
+                                 "raw=%.2f cm cam=%.2f cm | dt %.1f-%.1f ms",
+                                 (int)anchored, uc::object_name(mesh).c_str(),
+                                 m_worst_raw, m_worst_cam, m_dt_min * 1000.0f,
+                                 m_dt_max * 1000.0f);
+            m_probe_time = 0.0f;
+            m_worst_raw = m_worst_cam = 0.0f;
+            m_dt_min = 999.0f;
+            m_dt_max = 0.0f;
+        }
+    }
+
+    const float before[3]{m_eye[0], m_eye[1], m_eye[2]};
+
     if (anchored) {
         m_eye[0] = anchor.x + m_off[0];
         m_eye[1] = anchor.y + m_off[1];
@@ -125,6 +169,16 @@ void Eye::update(API::UObject* pawn, API::UObject* mesh, float delta, bool gamep
         m_eye[0] = head.x;
         m_eye[1] = head.y;
         m_eye[2] = head.z;
+    }
+
+    if (m_have_eye) {
+        const float cdx = m_eye[0] - before[0];
+        const float cdy = m_eye[1] - before[1];
+        const float cdz = m_eye[2] - before[2];
+        const float c = std::sqrt(cdx * cdx + cdy * cdy + cdz * cdz);
+        if (c > m_worst_cam) {
+            m_worst_cam = c;
+        }
     }
 
 }

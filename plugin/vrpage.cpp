@@ -247,6 +247,20 @@ void take_focus(API::UObject* widget) {
 
 } // namespace
 
+bool VrPage::game_menu_visible() const {
+    if (m_menu == nullptr) {
+        return false;
+    }
+    uc::Call call{m_menu, L"IsVisible"};
+    if (!call.ok) {
+        return false;
+    }
+    m_menu->process_event(call.fn, call.bytes.data());
+    bool visible = false;
+    uc::result(call, visible);
+    return visible;
+}
+
 void VrPage::update(API::UObject* pawn, MenuSettings& live) {
     auto* menu = uc::property_object(pawn, L"PauseMenu");
     if (menu == nullptr) {
@@ -267,20 +281,13 @@ void VrPage::update(API::UObject* pawn, MenuSettings& live) {
             m_menu = nullptr; // try again next tick rather than give up on this session
             return;
         }
-        // The sliders start where the current settings are, so opening the page does not
-        // yank every value to whatever the widgets happened to default to.
-        set_slider(m_rows[SnapAngle].control,
-                   to_slider(live.snap_angle, m_rows[SnapAngle].lo, m_rows[SnapAngle].hi));
-        set_slider(m_rows[SmoothSpeed].control,
-                   to_slider(live.smooth_speed, m_rows[SmoothSpeed].lo, m_rows[SmoothSpeed].hi));
-        set_slider(m_rows[EyeForward].control,
-                   to_slider(live.forward_offset, m_rows[EyeForward].lo, m_rows[EyeForward].hi));
-        set_slider(m_rows[EyeHeight].control,
-                   to_slider(live.up_offset, m_rows[EyeHeight].lo, m_rows[EyeHeight].hi));
-        set_slider(m_rows[YawTrim].control,
-                   to_slider(live.yaw_offset, m_rows[YawTrim].lo, m_rows[YawTrim].hi));
-        set_checkbox(m_rows[SmoothTurn].control, live.turn_mode == 1);
-        set_checkbox(m_rows[ShowBody].control, live.body_mode == 1);
+        sync_from(live);
+        m_needs_sync = false;
+    }
+
+    if (m_needs_sync) {
+        m_needs_sync = false;
+        sync_from(live);
     }
 
     poll(live);
@@ -347,6 +354,7 @@ bool VrPage::build(API::UObject* menu) {
         {EyeHeight,   L"Eye height",   L"cm",   -15.0f,  15.0f, 1.0f,  false},
         {YawTrim,     L"Yaw trim",     L"deg",  -20.0f,  20.0f, 1.0f,  false},
         {ShowBody,    L"Show body",    nullptr,   0.0f,   1.0f, 1.0f,  true},
+        {MenuScale,   L"Menu size",    nullptr,   0.6f,   2.5f, 0.1f,  false},
     };
 
     for (const auto& spec : layout) {
@@ -432,10 +440,16 @@ void VrPage::refresh_label(Row& row, float value, bool focused) {
     wchar_t buffer[128]{};
     if (row.is_toggle) {
         _snwprintf_s(buffer, _TRUNCATE, L"%s%s", marker, row.label);
-    } else if (row.unit != nullptr) {
-        _snwprintf_s(buffer, _TRUNCATE, L"%s%s   %.0f %s", marker, row.label, value, row.unit);
     } else {
-        _snwprintf_s(buffer, _TRUNCATE, L"%s%s   %.0f", marker, row.label, value);
+        // Decimals follow the step: a row that moves in tenths has to show tenths, or every
+        // second nudge appears to do nothing and the value looks stuck.
+        const wchar_t* fmt_unit = row.step < 1.0f ? L"%s%s   %.1f %s" : L"%s%s   %.0f %s";
+        const wchar_t* fmt_bare = row.step < 1.0f ? L"%s%s   %.1f" : L"%s%s   %.0f";
+        if (row.unit != nullptr) {
+            _snwprintf_s(buffer, _TRUNCATE, fmt_unit, marker, row.label, value, row.unit);
+        } else {
+            _snwprintf_s(buffer, _TRUNCATE, fmt_bare, marker, row.label, value);
+        }
     }
     uc::set_text(row.text, buffer);
 
@@ -461,11 +475,37 @@ void VrPage::open_page(bool open) {
     take_focus(open ? m_rows[SnapAngle].control : m_entry);
 }
 
+// Pushes the settings onto the widgets, recording what was pushed so poll() can tell "the
+// player moved this" from "this widget is new and reads whatever it defaulted to".
+//
+// Called on a fresh pause-menu instance AND every time the page is opened. The second is
+// not redundant: the game builds a new WBP_PauseMenu each time you pause, so our sliders
+// are new widgets every time.
+void VrPage::sync_from(const MenuSettings& live) {
+    const auto push = [this](RowId id, float value) {
+        auto& row = m_rows[id];
+        const float n = to_slider(value, row.lo, row.hi);
+        set_slider(row.control, n);
+        row.pushed = n;
+    };
+
+    push(SnapAngle, live.snap_angle);
+    push(SmoothSpeed, live.smooth_speed);
+    push(EyeForward, live.forward_offset);
+    push(EyeHeight, live.up_offset);
+    push(YawTrim, live.yaw_offset);
+    push(MenuScale, live.menu_size);
+
+    set_checkbox(m_rows[SmoothTurn].control, live.turn_mode == 1);
+    set_checkbox(m_rows[ShowBody].control, live.body_mode == 1);
+}
+
 void VrPage::poll(MenuSettings& live) {
     // Edge-detected: IsPressed stays true for as long as the button is held.
     const bool entry_pressed = uc::is_pressed(m_entry);
     if (m_entry_was_pressed && !entry_pressed) {
         open_page(true);
+        m_needs_sync = true;
     }
     m_entry_was_pressed = entry_pressed;
 
@@ -476,6 +516,7 @@ void VrPage::poll(MenuSettings& live) {
     const bool back_pressed = uc::is_pressed(m_back);
     if (m_back_was_pressed && !back_pressed) {
         open_page(false);
+        m_closed = true;
         return;
     }
     m_back_was_pressed = back_pressed;
@@ -486,18 +527,34 @@ void VrPage::poll(MenuSettings& live) {
         uc::set_text(m_back_label, back_focused ? L" > RETURN" : L"   RETURN");
     }
 
-    const auto read = [this](RowId id) {
+    // Only a widget the player actually moved may change a setting; everything else keeps
+    // the value in force and is corrected back on screen. This is the fix for settings that
+    // "worked, then came back to default": reading the sliders unconditionally let a freshly
+    // rebuilt one overwrite a real choice with a default nobody made.
+    const auto read = [this](RowId id, float current) {
         auto& row = m_rows[id];
-        const float value = from_slider(slider_value(row.control), row.lo, row.hi, row.step);
+        const float raw = slider_value(row.control);
+        float value = current;
+        if (row.pushed < 0.0f || std::fabs(raw - row.pushed) > 0.0005f) {
+            value = from_slider(raw, row.lo, row.hi, row.step);
+            row.pushed = raw;
+        } else {
+            const float want = to_slider(current, row.lo, row.hi);
+            if (std::fabs(want - raw) > 0.0005f) {
+                set_slider(row.control, want);
+                row.pushed = want;
+            }
+        }
         refresh_label(row, value, has_focus(row.control));
         return value;
     };
 
-    live.snap_angle = read(SnapAngle);
-    live.smooth_speed = read(SmoothSpeed);
-    live.forward_offset = read(EyeForward);
-    live.up_offset = read(EyeHeight);
-    live.yaw_offset = read(YawTrim);
+    live.snap_angle = read(SnapAngle, live.snap_angle);
+    live.smooth_speed = read(SmoothSpeed, live.smooth_speed);
+    live.forward_offset = read(EyeForward, live.forward_offset);
+    live.up_offset = read(EyeHeight, live.up_offset);
+    live.yaw_offset = read(YawTrim, live.yaw_offset);
+    live.menu_size = read(MenuScale, live.menu_size);
 
     // The toggles carry no number, but they still want the focus marker.
     auto& smooth = m_rows[SmoothTurn];

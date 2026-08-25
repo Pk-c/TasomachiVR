@@ -34,6 +34,14 @@ public:
     // cutscenes. Does nothing while the wanted state is already applied.
     void apply(uevr::API::UObject* pawn, int mode, bool gameplay);
 
+    // Forget what was applied, so the next apply() puts it back on.
+    //
+    // Needed because re-initialising the animation resets the component underneath us: the
+    // hidden head bone comes back and, with it, the physics bodies - which on this character
+    // are only LeftArm and RightArm. That is why forcing an anim rebuild made the head and
+    // the arms shake, and why toggling BodyMode by hand fixed it.
+    void invalidate() { m_applied = -2; }
+
 private:
     // The skeletal mesh that actually carries the character: the one with a "Head" bone.
     // On foot that is CharacterMesh0, on the flying boat it is SK_Pc_01, and asking the
@@ -47,6 +55,7 @@ private:
     // has to re-apply.
     uevr::API::UObject* m_asset{nullptr};
     int m_applied{-2}; // -1 = restored, otherwise a Mode
+    int m_cycle_stage{0};
 };
 
 } // namespace tasomachivr

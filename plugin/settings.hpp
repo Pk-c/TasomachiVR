@@ -18,6 +18,11 @@ struct MenuSettings {
     float yaw_offset{0.0f};
     int   pause_button{3};
     int   body_mode{1};       // 0 whole mesh hidden, 1 headless body
+
+    // How big UEVR draws the game's interface plane. On the page because it has to be found
+    // by eye - too large and it runs past the edge of the headset's field of view, too small
+    // and the text is unreadable, and where that line falls depends on the headset.
+    float menu_size{1.5f};
 };
 
 } // namespace tasomachivr

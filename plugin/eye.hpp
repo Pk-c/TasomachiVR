@@ -65,6 +65,12 @@ private:
     float m_prev[3]{};
     float m_rate[3]{};
     bool  m_have_anchor{false};
+    float m_last_raw[3]{};
+    float m_worst_raw{0.0f};
+    float m_worst_cam{0.0f};
+    float m_dt_min{999.0f};
+    float m_dt_max{0.0f};
+    float m_probe_time{0.0f};
     bool  m_have_eye{false};
     bool  m_reported{false};
 };
