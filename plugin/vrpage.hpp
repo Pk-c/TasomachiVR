@@ -78,6 +78,9 @@ private:
         MenuScale,
         HudAlways,
         AirLift,
+        AirForward,
+        Detail,
+        Supersample,
         RowCount,
     };
 

@@ -32,6 +32,19 @@ struct MenuSettings {
     // Centimetres the eye is raised while airborne. On the page because it is judged by eye,
     // in a headset, mid-jump - which is not something a number in a file can be tuned by.
     float air_lift{18.0f};
+    // Pushed forward while airborne as well: the tuck brings the chest up AND
+    // forward, and height alone does not always clear it.
+    float air_forward{0.0f};
+
+    // Rendering, driven live through console commands rather than the game's ini - so both
+    // are judged in the headset and neither needs a restart.
+    //
+    // detail     how far away meshes keep their high LOD. 1 is the game's own choice; higher
+    //            pushes the switch further out, which is what stops things visibly popping.
+    // supersample  render scale in percent. The bluntest clarity gain there is in VR, and the
+    //            most expensive - it is the one to back off if the framerate suffers.
+    float detail{2.0f};
+    float supersample{120.0f};
 };
 
 } // namespace tasomachivr

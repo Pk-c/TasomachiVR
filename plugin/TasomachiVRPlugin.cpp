@@ -151,6 +151,9 @@ struct Config {
     bool  hud_always_on  = false;
 
     float eye_air_lift = 18.0f;
+    float eye_air_forward = 0.0f;
+    float detail = 2.0f;
+    float supersample = 120.0f;
     float eye_air_lift_speed = 12.0f;
 
     int   log_every      = 240;    // frames between diagnostic lines
@@ -245,6 +248,7 @@ public:
         // through GetChildrenCount/GetChildAt - reflected calls, not raw property reads,
         // which is what made an earlier probe fault.
         m_phase = 5;
+        push_render_settings();
         if (m_config.hud_probe && !m_hud_listed && m_gameplay.load() && !m_phase_disabled[5]) {
             auto* klass = API::get()->find_uobject<API::UClass>(
                 L"WidgetBlueprintGeneratedClass /Game/ThirdPersonBP/Blueprints/"
@@ -485,13 +489,14 @@ public:
                 airborne = (*mode == 3);
             }
         }
+        // A single 0..1 blend for both airborne offsets, so they cannot drift out of step
+        // with each other and one speed setting governs the pair.
         {
             const float dt = delta > 0.0f ? delta : 0.016f;
             float k = dt * m_config.eye_air_lift_speed;
             k = k < 0.0f ? 0.0f : (k > 1.0f ? 1.0f : k);
-            const float target = airborne ? m_config.eye_air_lift : 0.0f;
-            m_air_lift_now.store(m_air_lift_now.load() +
-                                 (target - m_air_lift_now.load()) * k);
+            const float target = airborne ? 1.0f : 0.0f;
+            m_air_blend.store(m_air_blend.load() + (target - m_air_blend.load()) * k);
         }
 
         if (++m_frames >= m_config.log_every) {
@@ -721,9 +726,15 @@ public:
         // deliberately: UEVR's own camera offset follows the full view direction, and
         // having one of the two stay level is what keeps looking down from sliding the
         // eye into the chest.
+        // Airborne, the eye is pushed forward as well as up. Same reason as the lift: the
+        // jump animation tucks the character, and the chest comes up and FORWARD into a
+        // viewpoint that never moved - height alone does not always clear it.
+        const float blend = m_air_blend.load();
+        const float forward = m_config.forward_offset + m_config.eye_air_forward * blend;
+
         const float r = m_final_yaw.load() * kDegToRad;
-        position->x += std::cos(r) * m_config.forward_offset;
-        position->y += std::sin(r) * m_config.forward_offset;
+        position->x += std::cos(r) * forward;
+        position->y += std::sin(r) * forward;
 
         // Raised while airborne, eased both ways. The jump animation tucks the character up,
         // and knees and chest rise into a viewpoint that is otherwise perfectly placed - this
@@ -732,7 +743,7 @@ public:
         // Applied HERE now, on the offset that places the eye, rather than to a camera
         // position of our own: UEVR owns that position, which is what makes its roomscale and
         // its wall collision work.
-        position->z += m_config.up_offset + m_air_lift_now.load();
+        position->z += m_config.up_offset + m_config.eye_air_lift * blend;
     }
 
 private:
@@ -759,6 +770,9 @@ private:
         s.menu_size      = m_config.menu_size;
         s.hud_always_on  = m_config.hud_always_on;
         s.air_lift       = m_config.eye_air_lift;
+        s.air_forward    = m_config.eye_air_forward;
+        s.detail         = m_config.detail;
+        s.supersample    = m_config.supersample;
 
         // The page only writes while it is open, so the ini still governs the rest of
         // the time.
@@ -774,6 +788,9 @@ private:
         m_config.menu_size      = s.menu_size;
         m_config.hud_always_on  = s.hud_always_on;
         m_config.eye_air_lift   = s.air_lift;
+        m_config.eye_air_forward = s.air_forward;
+        m_config.detail          = s.detail;
+        m_config.supersample     = s.supersample;
 
         // Closing the page is when the player is done choosing, so that is when the choices
         // are written. Saving every tick would rewrite the file while a slider is dragged.
@@ -1298,6 +1315,9 @@ private:
             {"MenuSize",        format_number(m_config.menu_size)},
             {"HudAlwaysOn",     std::to_string(m_config.hud_always_on ? 1 : 0)},
             {"EyeAirLift",      format_number(m_config.eye_air_lift)},
+            {"EyeAirForward",   format_number(m_config.eye_air_forward)},
+            {"Detail",          format_number(m_config.detail)},
+            {"Supersample",     format_number(m_config.supersample)},
         };
 
         const auto path = settings_path();
@@ -1346,6 +1366,40 @@ private:
         std::error_code ec;
         m_config_stamp = std::filesystem::last_write_time(path, ec);
         API::get()->log_info("[TasomachiVR] settings saved");
+    }
+
+    // Rendering cvars, pushed only when a value actually changes.
+    //
+    // Console commands rather than the game's Engine.ini: they take effect immediately, so
+    // both of these can be judged in the headset instead of over a restart, and nothing is
+    // left behind in the game's own configuration when the mod is removed.
+    //
+    // r.StaticMeshLODDistanceScale is INVERTED - smaller means LODs are swapped later, so
+    // more detail. The page offers "detail", the sane direction, and the reciprocal goes to
+    // the cvar. foliage.LODDistanceScale runs the other way round, and gets the value as is.
+    void push_render_settings() {
+        if (std::fabs(m_config.detail - m_detail_applied) > 0.01f) {
+            m_detail_applied = m_config.detail;
+            const float scale = m_config.detail > 0.1f ? 1.0f / m_config.detail : 1.0f;
+            wchar_t cmd[128]{};
+            _snwprintf_s(cmd, _TRUNCATE, L"r.StaticMeshLODDistanceScale %.3f", scale);
+            API::get()->execute_command(cmd);
+            _snwprintf_s(cmd, _TRUNCATE, L"foliage.LODDistanceScale %.3f", m_config.detail);
+            API::get()->execute_command(cmd);
+            _snwprintf_s(cmd, _TRUNCATE, L"r.ViewDistanceScale %.3f", m_config.detail);
+            API::get()->execute_command(cmd);
+            API::get()->log_info("[TasomachiVR] render: detail %.1f (LOD scale %.2f)",
+                                 m_config.detail, scale);
+        }
+
+        if (std::fabs(m_config.supersample - m_supersample_applied) > 0.5f) {
+            m_supersample_applied = m_config.supersample;
+            wchar_t cmd[128]{};
+            _snwprintf_s(cmd, _TRUNCATE, L"r.ScreenPercentage %.0f", m_config.supersample);
+            API::get()->execute_command(cmd);
+            API::get()->log_info("[TasomachiVR] render: screen percentage %.0f",
+                                 m_config.supersample);
+        }
     }
 
     // Trimmed of trailing zeroes, so the file stays as readable as it was written.
@@ -1451,6 +1505,10 @@ private:
             else if (key == "HudAlwaysOn")   m_config.hud_always_on = std::atoi(value.c_str()) != 0;
             else if (key == "EyeAirLift")
                 m_config.eye_air_lift = (float)std::atof(value.c_str());
+            else if (key == "Detail")        m_config.detail = (float)std::atof(value.c_str());
+            else if (key == "Supersample")   m_config.supersample = (float)std::atof(value.c_str());
+            else if (key == "EyeAirForward")
+                m_config.eye_air_forward = (float)std::atof(value.c_str());
             else if (key == "EyeAirLiftSpeed")
                 m_config.eye_air_lift_speed = (float)std::atof(value.c_str());
             else if (key == "LogEvery")      m_config.log_every = std::atoi(value.c_str());
@@ -1468,7 +1526,9 @@ private:
     std::atomic<float> m_turn_axis{0.0f};
     std::atomic<float> m_quat_yaw{0.0f};
     // Cancels the anchor rotation for the view and the body, and for nothing else.
-    std::atomic<float> m_air_lift_now{0.0f};
+    float m_detail_applied{-1.0f};
+    float m_supersample_applied{-1.0f};
+    std::atomic<float> m_air_blend{0.0f};
     std::atomic<float> m_anchor_trim{0.0f};
     std::atomic<float> m_final_yaw{0.0f};
     // The yaw actually written to the pawn, held still while the headset only jitters.
