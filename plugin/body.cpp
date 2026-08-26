@@ -112,8 +112,12 @@ API::UObject* Body::find_head_mesh(API::UObject* pawn) {
 }
 
 void Body::apply(API::UObject* pawn, int mode, bool gameplay) {
-    if (pawn != m_pawn) {
+    // Same address-reuse trap as refresh_pawn, and worse here: m_mesh would be a freed
+    // skeletal mesh component that this class writes bone visibility into every tick.
+    const std::wstring id = pawn != nullptr ? pawn->get_full_name() : std::wstring{};
+    if (pawn != m_pawn || id != m_pawn_id) {
         m_pawn = pawn;
+        m_pawn_id = id;
         m_mesh = find_head_mesh(pawn);
         m_asset = nullptr;
         m_applied = -2;
@@ -177,6 +181,7 @@ void Body::apply(API::UObject* pawn, int mode, bool gameplay) {
         hide_bone(m_mesh, kHeadBone);
         break;
 
+    case Whole:
     default: // cutscenes frame the character and need her whole
         render_in_main_pass(m_mesh, true);
         unhide_bone(m_mesh, kHeadBone);

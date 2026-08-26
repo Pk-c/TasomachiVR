@@ -19,6 +19,8 @@
 // her whole.
 #pragma once
 
+#include <string>
+
 #include <uevr/API.hpp>
 
 namespace tasomachivr {
@@ -28,6 +30,10 @@ public:
     enum Mode {
         Hidden = 0,
         Headless = 1,
+        // Whole, head included. Used when the camera has moved far enough from the head that
+        // you would be looking at a headless character rather than out of her eyes - which is
+        // the only reason the head was ever hidden.
+        Whole = 2,
     };
 
     // Call every tick, including outside gameplay - that is how the body comes back for
@@ -49,6 +55,9 @@ private:
     uevr::API::UObject* find_head_mesh(uevr::API::UObject* pawn);
 
     uevr::API::UObject* m_pawn{nullptr};
+    // Identity by name, so an address handed back after a zone unload is not mistaken
+    // for the pawn that used to live there.
+    std::wstring m_pawn_id{};
     uevr::API::UObject* m_mesh{nullptr};
     // The SkeletalMesh asset currently on the component. The game swaps it for costume
     // changes, which rebuilds the skeleton and undoes a hidden bone, so a change here
