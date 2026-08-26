@@ -56,16 +56,24 @@ void unhide_bone(API::UObject* mesh, const wchar_t* bone) {
 }
 
 void render_in_main_pass(API::UObject* mesh, bool render) {
-    uc::call_one(mesh, L"SetRenderInMainPass", render);
+    if (!uc::call_one(mesh, L"SetRenderInMainPass", render)) {
+        mesh->set_bool_property(L"bRenderInMainPass", render);
+    }
 }
 
-// Written directly: there is no reachable setter, and it is a plain bool on the
-// component. Without it, a mesh dropped from the main pass casts no shadow at all.
+// THESE ARE BITFIELDS, NOT BYTES.
+//
+// bVisible, bRenderInMainPass, CastShadow and friends are one-bit members packed together,
+// so get_property_data<bool> hands back the whole byte they share - which is how a readback
+// reported "visible=97 mainpass=141 castshadow=249". Reading that way is merely useless;
+// WRITING that way, as the fallback below used to, stamps a byte over the bitfield and
+// silently flips every neighbouring flag with it.
+//
+// set_bool_property/get_bool_property know the mask and the offset, and are the only correct
+// way to touch them.
 void set_cast_hidden_shadow(API::UObject* mesh, bool cast) {
     if (!uc::call_one(mesh, L"SetCastHiddenShadow", cast)) {
-        if (auto* flag = mesh->get_property_data<bool>(L"bCastHiddenShadow")) {
-            *flag = cast;
-        }
+        mesh->set_bool_property(L"bCastHiddenShadow", cast);
     }
 }
 

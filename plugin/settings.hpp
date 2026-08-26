@@ -45,6 +45,7 @@ struct MenuSettings {
     //            most expensive - it is the one to back off if the framerate suffers.
     float detail{2.0f};
     float supersample{120.0f};
+
 };
 
 } // namespace tasomachivr

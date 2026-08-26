@@ -39,7 +39,6 @@ public:
     // Call every tick, including outside gameplay - that is how the body comes back for
     // cutscenes. Does nothing while the wanted state is already applied.
     void apply(uevr::API::UObject* pawn, int mode, bool gameplay);
-
     // Forget what was applied, so the next apply() puts it back on.
     //
     // Needed because re-initialising the animation resets the component underneath us: the

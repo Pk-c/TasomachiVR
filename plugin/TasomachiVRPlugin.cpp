@@ -145,7 +145,6 @@ struct Config {
     bool  swap_sticks    = false;
     // 0 = leave it alone, 1 = X, 2 = Y, 3 = A, 4 = B.
     int   interact_button = 4;
-    bool  hud_probe      = true;   // one-shot listing of the HUD tree
     // Widget names to fade, and how fast. Empty means the feature is off.
     std::string hud_counters;
     float hud_counter_fade = 8.0f;
@@ -166,11 +165,6 @@ struct Config {
     std::string button_event{
         "Y:InpActEvt_Gamepad_DPad_Down_K2Node_InputKeyEvent_0,"
         "X:InpActEvt_V_K2Node_InputKeyEvent_2"};
-    std::string event_actor{
-        "BlueprintGeneratedClass /Game/ThirdPersonBP/Blueprints/"
-        "BP_CommonSystem.BP_CommonSystem_C"};
-    bool event_probe{false};
-    std::string event_probe_match{"CommonSystem"};
     std::string event_actor_class{"BP_CommonSystem_C"};
     bool  block_triggers = true;
     int   trigger_threshold = 60;   // of 255
@@ -265,43 +259,8 @@ public:
         if (!m_phase_disabled[4]) {
             drive_vr_page();
         }
-        // One-shot: find the game's HUD and list its widget tree, so the two counters can
-        // be named rather than guessed at. Off unless HudProbe is set, and it walks children
-        // through GetChildrenCount/GetChildAt - reflected calls, not raw property reads,
-        // which is what made an earlier probe fault.
         m_phase = 5;
         push_render_settings();
-        if (m_config.hud_probe && !m_hud_listed && m_gameplay.load() && !m_phase_disabled[5]) {
-            auto* klass = API::get()->find_uobject<API::UClass>(
-                L"WidgetBlueprintGeneratedClass /Game/ThirdPersonBP/Blueprints/"
-                L"WBP_HUD.WBP_HUD_C");
-            if (klass != nullptr) {
-                const auto found = klass->get_objects_matching<API::UObject>(false);
-                for (auto* hud : found) {
-                    if (hud == nullptr) {
-                        continue;
-                    }
-                    const auto full = narrow(hud->get_full_name());
-                    if (full.find("WidgetArchetype") != std::string::npos ||
-                        full.find("Default__") != std::string::npos) {
-                        continue;   // the template, not the widget on screen
-                    }
-                    m_hud_listed = true;
-                    API::get()->log_info("[TasomachiVR] HUDTREE | %s",
-                                         narrow(hud->get_full_name()).c_str());
-                    if (auto* tree = deref_object(hud, L"WidgetTree")) {
-                        if (auto* root = deref_object(tree, L"RootWidget")) {
-                            list_widgets(root, 0);
-                        }
-                    }
-                    break;
-                }
-            }
-            if (!m_hud_listed) {
-                API::get()->log_info("[TasomachiVR] HUDTREE | no live WBP_HUD_C found");
-                m_hud_listed = true;
-            }
-        }
 
         m_phase = 6;
         if (!m_phase_disabled[6]) {
@@ -642,19 +601,12 @@ public:
         // drift forwards and nothing else. Handing the camera back - which is what happens
         // for that pawn - has to mean handing the controls back with it.
         if (user_index == 0) {
+            // Captured before this function edits anything: a ButtonEvent may be driven
+            // by a pad bit, and the remap below clears the very bits it reads.
+            m_raw_buttons.store(state->Gamepad.wButtons);
             m_left_trigger.store(state->Gamepad.bLeftTrigger);
             // The grip arrives as LeftShoulder - that is what the game binds CamReset to.
             m_left_grip.store((state->Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0);
-
-            // Reported a few times, because the counters kept coming back visible and the
-            // trigger was the reason without ever being looked at. A resting value that is
-            // not zero reads as "held" forever, and that is invisible from the symptom.
-            if (m_input_reports < 3) {
-                ++m_input_reports;
-                API::get()->log_info("[TasomachiVR] input at rest: LT=%d RT=%d grip=%d",
-                                     state->Gamepad.bLeftTrigger, state->Gamepad.bRightTrigger,
-                                     (int)m_left_grip.load());
-            }
 
             if (m_config.block_triggers && m_gameplay.load()) {
                 state->Gamepad.bLeftTrigger = 0;
@@ -686,6 +638,8 @@ public:
         if (user_index == 0) {
             apply_button_remaps(state);
             apply_button_events();
+            // Withheld after the events have read them from the untouched copy above.
+            state->Gamepad.wButtons &= ~m_event_source_mask.load();
         }
 
         if (user_index == 0 && m_config.interact_button != 0) {
@@ -1014,6 +968,18 @@ private:
             }
         }
 
+        // THE CHARACTER, KEPT WHILE SOMETHING ELSE IS POSSESSED.
+        //
+        // Photo mode possesses PhotoMode_Camera, so from that moment get_local_pawn returns
+        // the camera and the character is unreachable through it. Everything that asks about
+        // the PLAYER - what animation she is in, which flag to suspend - has to keep asking
+        // about her, or it goes blind exactly when photo mode is open. That is why the mode
+        // could be entered from a bench and never left: the closing press could no longer
+        // read the condition it had been allowed in by.
+        if (m_is_character && m_pawn_playable) {
+            m_character = pawn;
+        }
+
         m_flag_age = 0; // re-assert the movement flags immediately on a new pawn
         // A new pawn faces wherever it spawned; carrying the old held yaw over would fight
         // it for one deadzone's worth before catching up.
@@ -1067,31 +1033,6 @@ private:
     // manifest; the handle is resolved once, since a bad path would otherwise be
     // retried on every poll and stay invisible.
     // The chosen face button, read straight from the VR runtime.
-    // Names and classes, indented by depth. Bounded on both depth and count: a widget tree
-    // is a tree, and a probe that can run away is worse than none.
-    void list_widgets(API::UObject* widget, int depth) {
-        if (widget == nullptr || depth > 6 || ++m_hud_lines > 120) {
-            return;
-        }
-        std::string pad(static_cast<size_t>(depth) * 2, ' ');
-        auto* wc = widget->get_class();
-        API::get()->log_info("[TasomachiVR] HUDTREE | %s%s : %s", pad.c_str(),
-                             narrow(widget->get_fname()->to_string()).c_str(),
-                             wc != nullptr && wc->get_fname() != nullptr
-                                 ? narrow(wc->get_fname()->to_string()).c_str() : "?");
-
-        uc::Call count{widget, L"GetChildrenCount"};
-        if (!count.ok) {
-            return;   // not a panel, so it has no children
-        }
-        widget->process_event(count.fn, count.bytes.data());
-        int32_t n = 0;
-        uc::result(count, n);
-        for (int32_t i = 0; i < n && i < 40; ++i) {
-            list_widgets(uc::child_at(widget, i), depth + 1);
-        }
-    }
-
     // Collects the named widgets out of the HUD's tree, once.
     void find_counters(API::UObject* widget, int depth) {
         if (widget == nullptr || depth > 6 || m_counters.size() >= 8) {
@@ -1283,6 +1224,11 @@ private:
         if (n == "DPadRight") return XINPUT_GAMEPAD_DPAD_RIGHT;
         if (n == "LShoulder") return XINPUT_GAMEPAD_LEFT_SHOULDER;
         if (n == "RShoulder") return XINPUT_GAMEPAD_RIGHT_SHOULDER;
+        // The Touch grips arrive as the shoulder buttons - measured, not assumed: that is
+        // how the left grip was found when it took over revealing the interface. The aliases
+        // exist so the ini can say what the hand does rather than what the pad calls it.
+        if (n == "LGrip")     return XINPUT_GAMEPAD_LEFT_SHOULDER;
+        if (n == "RGrip")     return XINPUT_GAMEPAD_RIGHT_SHOULDER;
         if (n == "Start") return XINPUT_GAMEPAD_START;
         if (n == "Back") return XINPUT_GAMEPAD_BACK;
         if (n == "L3") return XINPUT_GAMEPAD_LEFT_THUMB;
@@ -1321,48 +1267,107 @@ private:
                 const std::string from = trim(pair.substr(0, colon));
                 std::string fn = trim(pair.substr(colon + 1));
 
-                // An optional literal argument, written as Name(1). A Blueprint event that
-                // TOGGLES something takes a bool, and a zero-filled parameter block means
-                // "false" - which calls cleanly and does nothing at all, exactly the way
-                // this first failed. One byte covers a bool and a small int alike, since
-                // the rest of the block is already zero.
-                int arg = -1;
-                if (!fn.empty() && fn.back() == ')') {
-                    const auto open = fn.find('(');
-                    if (open != std::string::npos) {
-                        arg = std::atoi(fn.substr(open + 1, fn.size() - open - 2).c_str());
-                        fn = fn.substr(0, open);
+                // +[system.]Name[=0|1][@CondClass.CondFlag]
+                std::vector<Bypass> bypass;
+                for (auto plus = fn.find('+'); plus != std::string::npos;
+                     plus = fn.find('+')) {
+                    std::string spec = fn.substr(plus + 1);
+                    fn = fn.substr(0, plus);
+                    if (spec.empty()) {
+                        continue;
+                    }
+                    Bypass b{};
+                    if (const auto at = spec.find('@'); at != std::string::npos) {
+                        const std::string cond = spec.substr(at + 1);
+                        spec = spec.substr(0, at);
+                        if (cond.rfind("anim:", 0) == 0) {
+                            b.cond_anim = cond.substr(5);
+                        }
+                    }
+                    if (const auto eq = spec.find('='); eq != std::string::npos) {
+                        b.value = spec.substr(eq + 1) != "0";
+                        spec = spec.substr(0, eq);
+                    }
+                    if (spec.rfind("system.", 0) == 0) {
+                        b.on_system = true;
+                        spec = spec.substr(7);
+                    }
+                    b.name.assign(spec.begin(), spec.end());
+                    if (!b.name.empty()) {
+                        bypass.push_back(b);
                     }
                 }
 
+                // "pawn." calls the function on the PLAYER CHARACTER instead of on the
+                // event actor. The character carries its own key handlers - the stomp among
+                // them - and calling one is the same trick that opened photo mode: it runs
+                // what the key would run, without depending on the key arriving.
+                bool on_pawn = false;
+                if (fn.rfind("pawn.", 0) == 0) {
+                    on_pawn = true;
+                    fn = fn.substr(5);
+                }
+
+                // A source that is not one of the named VR buttons is read as a pad bit,
+                // which is how the grips arrive.
+                bool matched = false;
                 for (size_t i = 0; i < count; ++i) {
                     if (from != table[i].name) {
                         continue;
                     }
+                    matched = true;
                     EventBind b{};
                     b.action = vr->get_action_handle(table[i].action);
                     b.left = table[i].left;
-                    b.arg = arg;
+                    b.on_pawn = on_pawn;
+                    b.bypass = bypass;
                     b.fn.assign(fn.begin(), fn.end());
                     if (b.action == nullptr) {
                         API::get()->log_error("[TasomachiVR] event: %s did not resolve",
                                               table[i].action);
                     } else {
                         m_events.push_back(b);
-                        API::get()->log_info("[TasomachiVR] event: %s -> %s(%s)",
-                                             from.c_str(), fn.c_str(),
-                                             arg < 0 ? "" : std::to_string(arg).c_str());
+                        API::get()->log_info("[TasomachiVR] event: %s -> %s(), "
+                                             "%d flag(s)", from.c_str(), fn.c_str(),
+                                             (int)bypass.size());
                     }
                     break;
+                }
+
+                if (!matched) {
+                    const WORD src = xinput_bit(from);
+                    if (src == 0) {
+                        API::get()->log_error("[TasomachiVR] event: '%s' is neither a VR "
+                                              "button nor a pad button", from.c_str());
+                        continue;
+                    }
+                    EventBind b{};
+                    b.from_bit = src;
+                    b.on_pawn = on_pawn;
+                    b.bypass = bypass;
+                    b.fn.assign(fn.begin(), fn.end());
+                    m_events.push_back(b);
+                    // A MOVE, NOT A COPY - the same rule the remap followed. A pad control
+                    // driving one of these stops doing whatever the game had on it, or the
+                    // right grip would stomp AND run at the same time.
+                    m_event_source_mask.fetch_or(src);
+                    API::get()->log_info("[TasomachiVR] event: %s -> %s%s() (pad source)",
+                                         from.c_str(), on_pawn ? "pawn." : "", fn.c_str());
                 }
             }
         }
 
+        const uint16_t raw = m_raw_buttons.load();
         for (size_t i = 0; i < m_events.size(); ++i) {
             auto& b = m_events[i];
-            const auto source = b.left ? vr->get_left_joystick_source()
-                                       : vr->get_right_joystick_source();
-            const bool held = vr->is_action_active(b.action, source);
+            bool held;
+            if (b.from_bit != 0) {
+                held = (raw & b.from_bit) != 0;
+            } else {
+                const auto source = b.left ? vr->get_left_joystick_source()
+                                           : vr->get_right_joystick_source();
+                held = vr->is_action_active(b.action, source);
+            }
             if (held == b.was_held) {
                 continue;
             }
@@ -1373,84 +1378,63 @@ private:
         }
     }
 
-    // What actually exists, reported rather than assumed.
+    // WHAT ANIMATION IS THE CHARACTER PLAYING RIGHT NOW?
     //
-    // Two things are unknown and both are answered here: whether the object array can be
-    // walked at all, and what class the actor handling the keys really is. Matching on a
-    // class NAME substring rather than on is_a() is deliberate - if the class object that
-    // find_uobject returns is not the one instances point at, is_a fails while the name
-    // still matches, and that difference is exactly what needed measuring. It did fail.
-    void probe_objects() {
-        auto* array = API::FUObjectArray::get();
-        if (array == nullptr) {
-            API::get()->log_error("[TasomachiVR] EVENTS | no object array");
-            return;
+    // This exists because isSitting? on the bench turned out to be a PULSE, not a state: the
+    // log has it going true and back to false inside 0.7s, at the transition, while sitting
+    // itself lasts as long as you like. A condition sampled at the instant of a button press
+    // could therefore never see it, which is exactly what happened.
+    //
+    // The bench drives the pose with PlayAnimation and SetAnimationMode, so the character's
+    // single-node animation IS the state, and it lasts precisely as long as the sitting does.
+    // CurrentAsset is read as a property rather than through GetAnimationAsset, because a
+    // property either exists or does not, while a function may simply not be exposed.
+    std::string current_anim_name() {
+        auto* pawn = m_character != nullptr ? m_character : API::get()->get_local_pawn(0);
+        if (pawn == nullptr) {
+            return {};
         }
-        const int32_t count = array->get_object_count();
-        API::get()->log_info("[TasomachiVR] EVENTS | object array holds %d", count);
-
-        int shown = 0;
-        for (int32_t i = 0; i < count && shown < 24; ++i) {
-            auto* obj = array->get_object(i);
-            if (obj == nullptr) {
-                continue;
-            }
-            auto* c = obj->get_class();
-            if (c == nullptr || c->get_fname() == nullptr) {
-                continue;
-            }
-            const auto cls = narrow(c->get_fname()->to_string());
-            if (cls.find(m_config.event_probe_match) == std::string::npos) {
-                continue;
-            }
-            ++shown;
-            API::get()->log_info("[TasomachiVR] EVENTS | %s : class %s",
-                                 narrow(obj->get_full_name()).c_str(), cls.c_str());
-
-            // Its signatures, from the instance we actually found. A no-argument call into a
-            // function that wanted one is indistinguishable in a log from a call that worked.
-            for (API::UStruct* st = c; st != nullptr; st = st->get_super_struct()) {
-                if (st->get_fname() == nullptr) {
-                    break;
-                }
-                const auto owner = narrow(st->get_fname()->to_string());
-                if (owner == "Actor") {
-                    break;   // engine boilerplate above this
-                }
-                for (auto* f = st->get_children(); f != nullptr; f = f->get_next()) {
-                    if (f->get_fname() == nullptr) {
-                        continue;
-                    }
-                    std::string params;
-                    auto* fn = reinterpret_cast<API::UFunction*>(f);
-                    for (auto* p = fn->get_child_properties(); p != nullptr;
-                         p = p->get_next()) {
-                        if (p->get_fname() == nullptr) {
-                            continue;
-                        }
-                        if (!params.empty()) {
-                            params += ", ";
-                        }
-                        if (auto* pc = p->get_class(); pc != nullptr) {
-                            params += narrow(pc->get_name()) + " ";
-                        }
-                        params += narrow(p->get_fname()->to_string());
-                    }
-                    API::get()->log_info("[TasomachiVR] EVENTS | %s::%s(%s)", owner.c_str(),
-                                         narrow(f->get_fname()->to_string()).c_str(),
-                                         params.c_str());
-                }
-            }
+        auto* mesh = deref_object(pawn, L"Mesh");
+        if (mesh == nullptr) {
+            return {};
         }
-        if (shown == 0) {
-            API::get()->log_error("[TasomachiVR] EVENTS | nothing whose class contains '%s'",
-                                  m_config.event_probe_match.c_str());
+        // GetAnimInstance, not GetSingleNodeInstance. The latter is a plain C++ method and
+        // is not in the reflection data at all - the probe listed every function on the whole
+        // class chain and it is simply absent, which is why this returned an empty string for
+        // three test rounds. In SingleNode mode the anim instance IS the single-node
+        // instance, so the exposed call reaches the same object.
+        uc::Call node{mesh, L"GetAnimInstance"};
+        if (!node.ok) {
+            if (m_anim_reports < 3) {
+                ++m_anim_reports;
+                API::get()->log_error("[TasomachiVR] anim: GetAnimInstance missing on %s",
+                                      uc::class_name(mesh).c_str());
+            }
+            return {};
         }
+        mesh->process_event(node.fn, node.bytes.data());
+        API::UObject* instance = nullptr;
+        uc::result(node, instance);
+        if (instance == nullptr) {
+            if (m_anim_reports < 3) {
+                ++m_anim_reports;
+                API::get()->log_error("[TasomachiVR] anim: no animation instance");
+            }
+            return {};
+        }
+        if (auto* asset = uc::property_object(instance, L"CurrentAsset")) {
+            return uc::object_name(asset);
+        }
+        if (m_anim_reports < 3) {
+            ++m_anim_reports;
+            API::get()->log_error("[TasomachiVR] anim: instance %s has no CurrentAsset",
+                                  uc::class_name(instance).c_str());
+        }
+        return {};
     }
 
     // The call half, on the game thread.
     void fire_button_events() {
-        const bool probing = m_config.event_probe && !m_event_listed;
         const uint32_t pending = m_event_pending.exchange(0);
 
         // NO FREE-CAMERA GUARD HERE, and that is a correction rather than an omission.
@@ -1459,40 +1443,10 @@ private:
         // that overlooked is that the bound function is the V handler - a TOGGLE - so the
         // press being suppressed was precisely the one that closes photo mode. Opening
         // worked and closing was impossible.
-        if (pending == 0 && !probing) {
+        if (pending == 0) {
             return;
         }
 
-        // GROUND TRUTH FIRST. This used to sit after the "no actor" early return, which
-        // meant the single situation it was written to explain was the one it could never
-        // report on. It now runs before anything can bail out.
-        if (probing) {
-            m_event_listed = true;
-            probe_objects();
-        }
-
-        const std::wstring path(m_config.event_actor.begin(), m_config.event_actor.end());
-        auto* klass = API::get()->find_uobject<API::UClass>(path.c_str());
-        (void)klass;   // kept only so a missing Blueprint is reported distinctly
-        if (klass == nullptr) {
-            if (pending != 0) {
-                API::get()->log_error("[TasomachiVR] event: class not found: %s",
-                                      m_config.event_actor.c_str());
-            }
-            return;
-        }
-
-        // THE GLOBAL OBJECT ARRAY, not UClass::get_objects_matching.
-        //
-        // That helper routes through UEVR's UObjectHook, which only knows the objects it has
-        // watched being constructed - so an actor placed in the level and built at map load
-        // is simply absent from it. It reported "no live instance" for a whole session while
-        // the keyboard V was opening photo mode at that very moment, which is proof the actor
-        // was there and the lookup was wrong, not the game.
-        //
-        // The raw array is what the engine itself iterates, so it cannot disagree. Scanning
-        // it costs a pass over every live UObject, which is why this runs on a button press
-        // and on the probe - never per frame.
         API::UObject* actor = nullptr;
         if (auto* array = API::FUObjectArray::get(); array != nullptr) {
             const int32_t count = array->get_object_count();
@@ -1506,8 +1460,10 @@ private:
                 // whole session while the actor sat in the level answering the keyboard.
                 // The name is what agreed with reality, so the name is what is tested.
                 auto* c = candidate->get_class();
-                if (c->get_fname() == nullptr ||
-                    narrow(c->get_fname()->to_string()) != m_config.event_actor_class) {
+                if (c->get_fname() == nullptr) {
+                    continue;
+                }
+                if (narrow(c->get_fname()->to_string()) != m_config.event_actor_class) {
                     continue;
                 }
                 const auto full = narrow(candidate->get_full_name());
@@ -1517,11 +1473,7 @@ private:
                 if (actor == nullptr) {
                     actor = candidate;
                 }
-                if (probing) {
-                    API::get()->log_info("[TasomachiVR] EVENTS | instance: %s", full.c_str());
-                } else {
-                    break;
-                }
+                break;
             }
         }
         if (actor == nullptr) {
@@ -1529,7 +1481,7 @@ private:
             if (pending != 0 && m_event_misses < 5) {
                 ++m_event_misses;
                 API::get()->log_error("[TasomachiVR] event: no live instance of %s",
-                                      m_config.event_actor.c_str());
+                                      m_config.event_actor_class.c_str());
             }
             return;
         }
@@ -1538,23 +1490,96 @@ private:
             if ((pending & (1u << i)) == 0) {
                 continue;
             }
-            uc::Call call{actor, m_events[i].fn.c_str()};
+            auto* subject =
+                m_character != nullptr ? m_character : API::get()->get_local_pawn(0);
+            auto* target = m_events[i].on_pawn ? subject : actor;
+            if (target == nullptr) {
+                continue;
+            }
+
+            // The name may be a PREFIX. A Blueprint key handler compiles to
+            // InpActEvt_<key>_K2Node_InputKeyEvent_<n>, and the number is an artifact of
+            // compile order that the cooked asset does not show - so an exact name would
+            // have to be read out of the running game and would break on a game patch.
+            std::wstring resolved = m_events[i].fn;
+            uc::Call call{target, resolved.c_str()};
+            if (!call.ok) {
+                if (auto* klass = target->get_class()) {
+                    for (auto* f = klass->get_children(); f != nullptr; f = f->get_next()) {
+                        if (f->get_fname() == nullptr) {
+                            continue;
+                        }
+                        const auto name = f->get_fname()->to_string();
+                        if (name.rfind(m_events[i].fn, 0) == 0) {
+                            resolved = name;
+                            break;
+                        }
+                    }
+                }
+                call = uc::Call{target, resolved.c_str()};
+                if (call.ok && m_events[i].reports < 8) {
+                    API::get()->log_info("[TasomachiVR] event: %s resolved to %s",
+                                         narrow(m_events[i].fn).c_str(),
+                                         narrow(resolved).c_str());
+                }
+            }
             if (!call.ok) {
                 API::get()->log_error("[TasomachiVR] event: %s has no function %s",
-                                      m_config.event_actor.c_str(),
+                                      m_config.event_actor_class.c_str(),
                                       narrow(m_events[i].fn).c_str());
                 continue;
             }
-            if (m_events[i].arg >= 0) {
-                if (auto* p = uc::param_at(call.fn, 0); p != nullptr) {
-                    const int32_t at = p->get_offset();
-                    if (at >= 0 && at < static_cast<int32_t>(call.bytes.size())) {
-                        call.bytes[static_cast<size_t>(at)] =
-                            static_cast<uint8_t>(m_events[i].arg);
+            // HELD, NOT OVERWRITTEN. Each flag is set to its chosen value, the call is
+            // made, and the original goes straight back - ProcessEvent is synchronous, so
+            // the graph reads its branch inside that window and the game's own state
+            // survives it. Leaving IsInAction? cleared would tell the game the character has
+            // stood up while she visibly has not.
+            auto* pawn_target =
+                m_character != nullptr ? m_character : API::get()->get_local_pawn(0);
+            std::vector<std::pair<API::UObject*, uint8_t>> saved;
+            saved.reserve(m_events[i].bypass.size());
+            std::string anim;
+            bool anim_read = false;
+            for (const auto& b : m_events[i].bypass) {
+                bool allowed = b.cond_anim.empty();
+                if (!b.cond_anim.empty()) {
+                    if (!anim_read) {
+                        anim_read = true;
+                        anim = current_anim_name();
+                    }
+                    allowed = anim.find(b.cond_anim) != std::string::npos;
+                    if (m_bypass_reports < 6) {
+                        ++m_bypass_reports;
+                        API::get()->log_info("[TasomachiVR] bypass: animation is '%s', "
+                                             "wanted '%s' -> %s", anim.c_str(),
+                                             b.cond_anim.c_str(), allowed ? "yes" : "no");
                     }
                 }
+                auto* flag_target = b.on_system ? actor : pawn_target;
+                if (!allowed || flag_target == nullptr) {
+                    saved.emplace_back(nullptr, 0);
+                    continue;
+                }
+                saved.emplace_back(flag_target,
+                                   flag_target->get_bool_property(b.name) ? 1 : 0);
+                flag_target->set_bool_property(b.name, b.value);
+                if (m_bypass_reports < 6) {
+                    ++m_bypass_reports;
+                    API::get()->log_info("[TasomachiVR] bypass: %ls held at %d (was %d)",
+                                         b.name.c_str(), (int)b.value,
+                                         (int)saved.back().second);
+                }
             }
-            actor->process_event(call.fn, call.bytes.data());
+
+            target->process_event(call.fn, call.bytes.data());
+
+            for (size_t k = 0; k < saved.size(); ++k) {
+                if (saved[k].first != nullptr) {
+                    saved[k].first->set_bool_property(m_events[i].bypass[k].name,
+                                                      saved[k].second != 0);
+                }
+            }
+            // Uncapped while probing: the whole point is to press again in another state.
             if (m_events[i].reports < 8) {
                 ++m_events[i].reports;
                 API::get()->log_info("[TasomachiVR] event: called %s()",
@@ -1596,6 +1621,11 @@ private:
                                           to.c_str());
                     continue;
                 }
+
+                // A source that is not one of the named VR buttons is read as an XInput bit
+                // instead. No action handle is involved, so nothing has to be guessed about
+                // which physical control the runtime decided to put it on.
+                bool matched = false;
                 for (size_t i = 0; i < count; ++i) {
                     if (from != table[i].name) {
                         continue;
@@ -1605,6 +1635,7 @@ private:
                     b.left = table[i].left;
                     b.bit = bit;
                     b.clear = xinput_bit(from);   // it stops doing whatever it did before
+                    matched = true;
                     if (b.action == nullptr) {
                         API::get()->log_error("[TasomachiVR] remap: %s did not resolve",
                                               table[i].action);
@@ -1615,14 +1646,44 @@ private:
                     }
                     break;
                 }
+
+                if (!matched) {
+                    const WORD src = xinput_bit(from);
+                    if (src == 0) {
+                        API::get()->log_error("[TasomachiVR] remap: '%s' is neither a VR "
+                                              "button nor an XInput button", from.c_str());
+                        continue;
+                    }
+                    Bound b{};
+                    b.from_bit = src;
+                    b.clear = src;
+                    b.bit = bit;
+                    m_remaps.push_back(b);
+                    API::get()->log_info("[TasomachiVR] remap: %s -> %s (xinput source)",
+                                         from.c_str(), to.c_str());
+                }
             }
         }
 
+        // Read before anything is rewritten: an XInput-sourced remap looks at the bit it
+        // came in on, and clearing as we go would erase the very thing being tested.
+        const WORD raw = state->Gamepad.wButtons;
+
         for (auto& b : m_remaps) {
+            // BOTH ENDS ARE CLEARED. The source stops doing its old job, and the destination
+            // is driven ONLY by this remap - otherwise the button that natively carried the
+            // destination still fires it, and the ability has been copied rather than moved.
             state->Gamepad.wButtons &= ~b.clear;
-            const auto source = b.left ? vr->get_left_joystick_source()
-                                       : vr->get_right_joystick_source();
-            const bool held = vr->is_action_active(b.action, source);
+            state->Gamepad.wButtons &= ~b.bit;
+
+            bool held;
+            if (b.from_bit != 0) {
+                held = (raw & b.from_bit) != 0;
+            } else {
+                const auto source = b.left ? vr->get_left_joystick_source()
+                                           : vr->get_right_joystick_source();
+                held = vr->is_action_active(b.action, source);
+            }
             if (held) {
                 state->Gamepad.wButtons |= b.bit;
             }
@@ -2115,7 +2176,6 @@ private:
             else if (key == "BodyMode")      m_config.body_mode = std::atoi(value.c_str());
             else if (key == "SwapSticks")    m_config.swap_sticks = std::atoi(value.c_str()) != 0;
             else if (key == "InteractButton") m_config.interact_button = std::atoi(value.c_str());
-            else if (key == "HudProbe")      m_config.hud_probe = std::atoi(value.c_str()) != 0;
             else if (key == "HudCounters")   m_config.hud_counters = value;
             else if (key == "HudCounterFade")
                 m_config.hud_counter_fade = (float)std::atof(value.c_str());
@@ -2125,9 +2185,6 @@ private:
             else if (key == "FreeCameraPawns") m_config.free_camera_pawns = value;
             else if (key == "ButtonRemap")   m_config.button_remap = value;
             else if (key == "ButtonEvent")    m_config.button_event = value;
-            else if (key == "EventActor")     m_config.event_actor = value;
-            else if (key == "EventProbe")     m_config.event_probe = value != "0";
-            else if (key == "EventProbeMatch") m_config.event_probe_match = value;
             else if (key == "EventActorClass") m_config.event_actor_class = value;
             else if (key == "BlockTriggers") m_config.block_triggers = std::atoi(value.c_str()) != 0;
             else if (key == "HudRevealSource")
@@ -2158,23 +2215,47 @@ private:
     // Cancels the anchor rotation for the view and the body, and for nothing else.
     std::atomic<float> m_cam[3]{};
     std::atomic<bool> m_cam_known{false};
+    // A remap source is either a VR action (a face button, whose physical bit is the
+    // runtime's business) or an XInput bit of its own - which is what the grips are, since
+    // they reach us already translated to the shoulder buttons.
     struct Bound { UEVR_ActionHandle action; bool left; WORD bit; WORD clear;
-                   bool was_held; int reports; };
+                   WORD from_bit; bool was_held; int reports; };
     std::vector<Bound> m_remaps{};
     bool m_remaps_parsed{false};
     // A button that calls a Blueprint event directly. The press is noticed on the input
     // thread and the call is made on the game thread, which is the only one allowed to
     // touch a UObject - hence the bitmask handing the edge across.
-    struct EventBind { UEVR_ActionHandle action; bool left; std::wstring fn;
-                       bool was_held; int reports; int arg; };
+    // One boolean held at a chosen value for the length of one call, then put back.
+    //
+    //   name        the property, on the player character or on the event actor
+    //   value       what to hold it at - false to lift a "player is busy" guard, true to
+    //               satisfy one the game has not granted yet
+    //   cond_*      the ONLY circumstance this is allowed in. Empty means always, which is
+    //               a decision to make deliberately: these flags exist for a reason and
+    //               suspending one everywhere re-enables things the game meant to withhold.
+    struct Bypass {
+        bool on_system{false};
+        std::wstring name;
+        bool value{false};
+        // Substring the character's current animation must contain. Lasts as long as the
+        // pose does, unlike the transition flags on the interactable itself.
+        std::string cond_anim;
+    };
+
+    struct EventBind { UEVR_ActionHandle action; bool left; WORD from_bit;
+                       bool on_pawn; std::wstring fn;
+                       bool was_held; int reports;
+                       std::vector<Bypass> bypass; };
     std::vector<EventBind> m_events{};
     bool m_events_parsed{false};
     std::atomic<uint32_t> m_event_pending{0};
-    bool m_event_listed{false};
     int m_event_misses{0};
+    int m_bypass_reports{0};
+    int m_anim_reports{0};
+    std::atomic<uint16_t> m_raw_buttons{0};
+    std::atomic<uint16_t> m_event_source_mask{0};
     std::atomic<int> m_left_trigger{0};
     std::atomic<bool> m_left_grip{false};
-    int m_input_reports{0};
     bool m_head_shown{false};
     float m_detail_applied{-1.0f};
     float m_supersample_applied{-1.0f};
@@ -2184,7 +2265,7 @@ private:
     // The yaw actually written to the pawn, held still while the headset only jitters.
     // How far the pre-tick got. 8 means it ran to the end; anything less, held across
     // frames, is the phase it dies in.
-    static constexpr int kPhases = 9;
+    static constexpr int kPhases = 8;
     int m_phase{0};
     int m_phase_max{0};
     bool m_phase_disabled[kPhases]{};
@@ -2214,8 +2295,6 @@ private:
     size_t m_counters_last{999};
     float m_counter_alpha{0.0f};
     float m_counter_shown{-1.0f};
-    bool m_hud_listed{false};
-    int  m_hud_lines{0};
     bool m_interact_resolved{false};
     bool m_interact_left{false};
     UEVR_ActionHandle m_pause_action{};
@@ -2228,6 +2307,8 @@ private:
     // The pawn's full name, instance number included - what makes a recycled address visible.
     std::wstring m_pawn_id{};
     API::UObject* m_cmc{nullptr};
+    // The last pawn that was actually the player character; see refresh_pawn.
+    API::UObject* m_character{nullptr};
     UEVR_Rotatorf* m_control_rotation{nullptr};
     std::wstring m_pawn_name{};
     bool m_is_character{false};
