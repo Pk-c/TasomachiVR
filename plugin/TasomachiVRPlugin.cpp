@@ -31,6 +31,7 @@
 #include <uevr/Plugin.hpp>
 
 #include "body.hpp"
+#include "poses.hpp"
 #include "settings.hpp"
 #include "ucall.hpp"
 #include "vrpage.hpp"
@@ -52,6 +53,7 @@ namespace uc = tasomachivr::ucall;
 
 using tasomachivr::Body;
 using tasomachivr::MenuSettings;
+using tasomachivr::Poses;
 using tasomachivr::VrPage;
 
 namespace {
@@ -166,6 +168,19 @@ struct Config {
         "Y:InpActEvt_Gamepad_DPad_Down_K2Node_InputKeyEvent_0,"
         "X:InpActEvt_V_K2Node_InputKeyEvent_2"};
     std::string event_actor_class{"BP_CommonSystem_C"};
+
+    // POSING HER IN PHOTO MODE. The button that steps through the loaded animations while
+    // the free camera is up, named the way the remap table names buttons: X, Y, A, B, L3,
+    // R3, or empty for off.
+    //
+    // A on the right hand by default. The game has PhotoAgility there - the free camera's
+    // speed boost - and the bit is deliberately NOT withheld, so the boost still works:
+    // holding A to fly faster and tapping A to change pose do not collide in practice,
+    // and taking a control away from photo mode to add one is a poor trade.
+    std::string pose_button{"A"};
+    // Which animations are offered. Every animation of the heroine is named ANM_Pc01_*,
+    // and matching on that is what keeps the birds and the townspeople out of the cycle.
+    std::string pose_prefix{"ANM_Pc01_"};
     bool  block_triggers = true;
     int   trigger_threshold = 60;   // of 255
     // What reveals the interface: 1 = left grip, 0 = left trigger.
@@ -270,6 +285,18 @@ public:
         m_phase = 7;
         if (!m_phase_disabled[7]) {
             fire_button_events();
+        }
+
+        m_phase = 8;
+        if (!m_phase_disabled[8]) {
+            // Turning the AnimBP off rebuilds the mesh component underneath the body, which
+            // brings the hidden head bone back along with the arm physics. That is exactly
+            // what invalidate() is for, and it is the caller's job because the body module
+            // has no idea anyone else is driving the animation.
+            if (m_poses.tick(m_character, m_free_camera.load(),
+                             m_pose_requests.exchange(0), m_config.pose_prefix)) {
+                m_body.invalidate();
+            }
         }
     }
 
@@ -638,6 +665,7 @@ public:
         if (user_index == 0) {
             apply_button_remaps(state);
             apply_button_events();
+            read_pose_button();
             // Withheld after the events have read them from the untouched copy above.
             state->Gamepad.wButtons &= ~m_event_source_mask.load();
         }
@@ -916,6 +944,7 @@ private:
         m_cmc = nullptr;
         m_is_character = false;
         m_pawn_playable = false;
+        m_free_camera.store(false);
         m_pawn_name.clear();
 
         if (pawn == nullptr) {
@@ -963,6 +992,7 @@ private:
             const std::string name = narrow(m_pawn_name);
             if (name.find(m_config.free_camera_pawns) != std::string::npos) {
                 m_pawn_playable = false;
+                m_free_camera.store(true);
                 API::get()->log_info("[TasomachiVR] %s aims its own camera - handing it back",
                                      name.c_str());
             }
@@ -977,6 +1007,13 @@ private:
         // could be entered from a bench and never left: the closing press could no longer
         // read the condition it had been allowed in by.
         if (m_is_character && m_pawn_playable) {
+            // A DIFFERENT character, not merely a re-possession. Leaving photo mode hands
+            // the same object back, and forgetting there would throw away the pose state
+            // one phase before the tick that has to undo it - which would leave her frozen
+            // in whatever she was posed in, permanently.
+            if (pawn != m_character) {
+                m_poses.forget();
+            }
             m_character = pawn;
         }
 
@@ -1375,6 +1412,70 @@ private:
             if (held) {
                 m_event_pending.fetch_or(1u << i);
             }
+        }
+    }
+
+    // THE POSE BUTTON. Read as a named VR action for the same reason every other button
+    // here is: which physical button arrives on which XInput bit is the runtime's decision,
+    // and assuming it is how Interact ended up on X.
+    //
+    // The edge is tracked whether or not photo mode is up, and only SPENT while it is. A
+    // press that began in gameplay - A is Jump - therefore cannot arrive as a pose the
+    // instant the camera opens.
+    //
+    // Nothing is called from here: this runs on whichever thread XInput is polled from, and
+    // a UFunction call from it is a crash waiting for a busy frame. The counter is the whole
+    // of the work.
+    void read_pose_button() {
+        if (m_config.pose_button.empty() || m_config.pose_button == "off") {
+            return;
+        }
+        const auto* vr = API::get()->param()->vr;
+        if (vr == nullptr) {
+            return;
+        }
+
+        if (!m_pose_resolved) {
+            m_pose_resolved = true;
+            size_t count = 0;
+            const auto* table = vr_buttons(count);
+            for (size_t i = 0; i < count; ++i) {
+                if (m_config.pose_button != table[i].name) {
+                    continue;
+                }
+                m_pose_action = vr->get_action_handle(table[i].action);
+                m_pose_left = table[i].left;
+                break;
+            }
+            // A source that is not one of the named VR buttons is read as a pad bit, which
+            // is how the grips arrive - the same fallback the event binds make.
+            if (m_pose_action == nullptr) {
+                m_pose_bit = xinput_bit(m_config.pose_button);
+            }
+            if (m_pose_action == nullptr && m_pose_bit == 0) {
+                API::get()->log_error("[TasomachiVR] poses: '%s' is neither a VR button nor "
+                                      "a pad button", m_config.pose_button.c_str());
+            } else {
+                API::get()->log_info("[TasomachiVR] poses: %s cycles the pose in photo mode",
+                                     m_config.pose_button.c_str());
+            }
+        }
+
+        bool held = false;
+        if (m_pose_action != nullptr) {
+            const auto source = m_pose_left ? vr->get_left_joystick_source()
+                                            : vr->get_right_joystick_source();
+            held = vr->is_action_active(m_pose_action, source);
+        } else if (m_pose_bit != 0) {
+            held = (m_raw_buttons.load() & m_pose_bit) != 0;
+        }
+
+        if (held == m_pose_was_held) {
+            return;
+        }
+        m_pose_was_held = held;
+        if (held && m_free_camera.load()) {
+            m_pose_requests.fetch_add(1);
         }
     }
 
@@ -2186,6 +2287,8 @@ private:
             else if (key == "ButtonRemap")   m_config.button_remap = value;
             else if (key == "ButtonEvent")    m_config.button_event = value;
             else if (key == "EventActorClass") m_config.event_actor_class = value;
+            else if (key == "PoseButton")    m_config.pose_button = value;
+            else if (key == "PosePrefix")    m_config.pose_prefix = value;
             else if (key == "BlockTriggers") m_config.block_triggers = std::atoi(value.c_str()) != 0;
             else if (key == "HudRevealSource")
                 m_config.hud_reveal_source = std::atoi(value.c_str());
@@ -2205,10 +2308,23 @@ private:
     Config m_config{};
 
     Body      m_body{};
+    Poses     m_poses{};
     VrPage m_vrpage{};
     float  m_widget_time{0.0f};
 
     std::atomic<bool>  m_gameplay{false};
+    // Photo mode, as far as everything outside refresh_pawn is concerned: a pawn that aims
+    // its own camera is up. Atomic because the input thread reads it to decide whether the
+    // pose button is ours this frame.
+    std::atomic<bool>  m_free_camera{false};
+    // Presses counted on the input thread, spent on the game thread. A counter rather than
+    // a flag so a quick double tap moves two poses instead of one.
+    std::atomic<unsigned> m_pose_requests{0};
+    UEVR_ActionHandle m_pose_action{};
+    bool m_pose_resolved{false};
+    bool m_pose_left{false};
+    WORD m_pose_bit{0};
+    bool m_pose_was_held{false};
     std::atomic<float> m_snap_yaw{0.0f};
     std::atomic<float> m_turn_axis{0.0f};
     std::atomic<float> m_quat_yaw{0.0f};
@@ -2263,9 +2379,9 @@ private:
     std::atomic<float> m_anchor_trim{0.0f};
     std::atomic<float> m_final_yaw{0.0f};
     // The yaw actually written to the pawn, held still while the headset only jitters.
-    // How far the pre-tick got. 8 means it ran to the end; anything less, held across
+    // How far the pre-tick got. 9 means it ran to the end; anything less, held across
     // frames, is the phase it dies in.
-    static constexpr int kPhases = 8;
+    static constexpr int kPhases = 9;
     int m_phase{0};
     int m_phase_max{0};
     bool m_phase_disabled[kPhases]{};
