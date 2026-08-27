@@ -168,7 +168,14 @@ void Body::apply(API::UObject* pawn, int mode, bool gameplay) {
     // does not depend on knowing the trigger at all.
     //
     // The cost is one frame with the body not drawn, at the moment gameplay begins.
-    if (wanted == Headless && m_cycle_stage == 0) {
+    // NOT WHEN COMING FROM Whole, which now happens on every jump.
+    //
+    // The cycle exists to force an unhide-then-hide sequence, because applying Headless
+    // straight left the head and the arms shivering. Coming from Whole the bone has already
+    // been unhidden for at least a frame, so the sequence has effectively happened - and
+    // paying the cycle's one frame of undrawn body at the start of every single jump would be
+    // a visible flicker for nothing.
+    if (wanted == Headless && m_cycle_stage == 0 && m_applied != Whole) {
         m_cycle_stage = 1;
         unhide_bone(m_mesh, kHeadBone);
         render_in_main_pass(m_mesh, false);

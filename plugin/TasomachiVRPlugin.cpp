@@ -100,8 +100,8 @@ struct Config {
     int   menu_repeat_ms = 260;
     bool  write_view_rot = true;
     // Pushes the eye out of the skull. Both are hot-reloaded from the ini.
-    float forward_offset = 20.0f;
-    float up_offset      = 15.0f;
+    float forward_offset = 25.0f;
+    float up_offset      = 0.0f;
 
     // 0 = snap, 1 = smooth. Snap is the default: it is the comfortable choice for most
     // people, and smooth turning is the classic way to make someone sick in VR.
@@ -141,6 +141,9 @@ struct Config {
     // What the player sees of themselves. 0 = whole mesh hidden, 1 = body visible with
     // the head bone collapsed. See body.hpp for what each costs.
     int   body_mode      = 1;
+    bool  head_hide_air_only = true;
+    // Seconds the head stays hidden after landing, so it does not reappear mid-recovery.
+    float head_hide_linger = 0.30f;
 
     // The eye follows the head bone, filtered. See eye.hpp for why the filter needs a
     // hard clamp as well as a low-pass.
@@ -152,9 +155,9 @@ struct Config {
     float hud_counter_fade = 8.0f;
     bool  hud_always_on  = false;
 
-    float eye_air_lift = 18.0f;
+    float eye_air_lift = 36.0f;
     float eye_air_forward = 0.0f;
-    float detail = 2.0f;
+    float detail = 4.0f;
     float supersample = 120.0f;
     // Centimetres from the head at which her head is drawn again. 0 = never.
     float head_reveal = 45.0f;
@@ -495,7 +498,46 @@ public:
         //
         // Hysteresis on the distance, because the two states differ by a full re-application
         // of the body and flickering between them would be worse than either.
+        // MovementMode is a TEnumAsByte - a whole byte, not a bitfield, so reading it is
+        // safe. EMovementMode: 1 = Walking, 3 = Falling.
+        bool airborne = false;
+        if (m_cmc != nullptr) {
+            if (auto* mode = m_cmc->get_property_data<uint8_t>(L"MovementMode")) {
+                airborne = (*mode == 3);
+            }
+        }
+
+        // HELD OVER THE LANDING. Re-armed for as long as she is off the ground, then it
+        // runs down - so the head stays away until the recovery animation has played out and
+        // does not flash back the instant her feet touch, which is the moment the tuck is
+        // still unwinding through the camera.
+        {
+            const float dt = delta > 0.0f ? delta : 0.016f;
+            if (airborne) {
+                m_air_linger = m_config.head_hide_linger;
+            } else if (m_air_linger > 0.0f) {
+                m_air_linger -= dt;
+            }
+        }
+
         int body_mode = menu_visible ? 0 : m_config.body_mode;
+
+        // THE HEAD IS ONLY IN THE WAY WHILE AIRBORNE, so that is the only time it is hidden.
+        //
+        // On the ground the head bone sits behind the eye and never intrudes - which is why
+        // the jump needed EyeAirLift and EyeAirForward in the first place: the tuck brings the
+        // chest and the head up and forward, into the camera.
+        //
+        // The point of this is the SHADOW. A hidden bone casts no shadow either, and no
+        // arrangement of meshes can separate the two - that was measured three ways. Hiding
+        // the head only during a jump means the shadow is whole for as long as you are
+        // standing on the ground looking at it, and headless only while you are in the air and
+        // not looking. It does not solve the problem; it moves it to where it does not show.
+        if (body_mode == 1 && m_config.head_hide_air_only && !airborne &&
+            m_air_linger <= 0.0f) {
+            body_mode = 2;   // Body::Whole
+        }
+
         if (body_mode == 1 && m_cam_known.load() && m_config.head_reveal > 0.0f) {
             auto* mesh = deref_object(m_pawn, L"Mesh");
             if (mesh == nullptr) {
@@ -525,14 +567,6 @@ public:
             return;
         }
 
-        // MovementMode is a TEnumAsByte - a whole byte, not a bitfield, so reading it is
-        // safe. EMovementMode: 1 = Walking, 3 = Falling.
-        bool airborne = false;
-        if (m_cmc != nullptr) {
-            if (auto* mode = m_cmc->get_property_data<uint8_t>(L"MovementMode")) {
-                airborne = (*mode == 3);
-            }
-        }
         // A single 0..1 blend for both airborne offsets, so they cannot drift out of step
         // with each other and one speed setting governs the pair.
         {
@@ -880,6 +914,7 @@ private:
         s.hud_always_on  = m_config.hud_always_on;
         s.air_lift       = m_config.eye_air_lift;
         s.air_forward    = m_config.eye_air_forward;
+        s.head_hide_linger = m_config.head_hide_linger;
         s.detail         = m_config.detail;
         s.supersample    = m_config.supersample;
 
@@ -898,6 +933,7 @@ private:
         m_config.hud_always_on  = s.hud_always_on;
         m_config.eye_air_lift   = s.air_lift;
         m_config.eye_air_forward = s.air_forward;
+        m_config.head_hide_linger = s.head_hide_linger;
         m_config.detail          = s.detail;
         m_config.supersample     = s.supersample;
 
@@ -2176,6 +2212,7 @@ private:
             {"HudAlwaysOn",     std::to_string(m_config.hud_always_on ? 1 : 0)},
             {"EyeAirLift",      format_number(m_config.eye_air_lift)},
             {"EyeAirForward",   format_number(m_config.eye_air_forward)},
+            {"HeadHideLinger",  format_number(m_config.head_hide_linger)},
             {"Detail",          format_number(m_config.detail)},
             {"Supersample",     format_number(m_config.supersample)},
         };
@@ -2266,6 +2303,11 @@ private:
     // Trimmed of trailing zeroes, so the file stays as readable as it was written.
     static std::string format_number(float v) {
         char buf[32]{};
+        // Negative zero reaches here from a slider dragged through the middle, and
+        // "-0" in a settings file reads like a mistake. Zero has one spelling.
+        if (v == 0.0f) {
+            return "0";
+        }
         std::snprintf(buf, sizeof(buf), "%.4g", v);
         return buf;
     }
@@ -2357,6 +2399,10 @@ private:
             else if (key == "GraftPauseMenu")
                 m_config.graft_pause_menu = std::atoi(value.c_str()) != 0;
             else if (key == "BodyMode")      m_config.body_mode = std::atoi(value.c_str());
+            else if (key == "HeadHideAirOnly")
+                m_config.head_hide_air_only = std::atoi(value.c_str()) != 0;
+            else if (key == "HeadHideLinger")
+                m_config.head_hide_linger = (float)std::atof(value.c_str());
             else if (key == "SwapSticks")    m_config.swap_sticks = std::atoi(value.c_str()) != 0;
             else if (key == "InteractButton") m_config.interact_button = std::atoi(value.c_str());
             else if (key == "HudCounters")   m_config.hud_counters = value;
@@ -2461,6 +2507,7 @@ private:
     float m_detail_applied{-1.0f};
     float m_supersample_applied{-1.0f};
     std::atomic<float> m_air_blend{0.0f};
+    float m_air_linger{0.0f};
     std::atomic<float> m_anchor_trim{0.0f};
     std::atomic<float> m_final_yaw{0.0f};
     // The yaw actually written to the pawn, held still while the headset only jitters.

@@ -13,8 +13,8 @@ struct MenuSettings {
     float snap_cooldown{0.3f};
     float smooth_speed{90.0f};
     float turn_deadzone{0.2f};
-    float forward_offset{10.0f};
-    float up_offset{6.0f};
+    float forward_offset{25.0f};
+    float up_offset{0.0f};
     float yaw_offset{0.0f};
     int   pause_button{3};
     int   body_mode{1};       // 0 whole mesh hidden, 1 headless body
@@ -31,10 +31,15 @@ struct MenuSettings {
 
     // Centimetres the eye is raised while airborne. On the page because it is judged by eye,
     // in a headset, mid-jump - which is not something a number in a file can be tuned by.
-    float air_lift{18.0f};
+    float air_lift{36.0f};
     // Pushed forward while airborne as well: the tuck brings the chest up AND
     // forward, and height alone does not always clear it.
     float air_forward{0.0f};
+
+    // Seconds the head stays hidden after landing. On the page because the right value is
+    // whatever stops it flashing back while the recovery animation is still unwinding, and
+    // that is only visible from inside the headset.
+    float head_hide_linger{0.30f};
 
     // Rendering, driven live through console commands rather than the game's ini - so both
     // are judged in the headset and neither needs a restart.
@@ -43,7 +48,7 @@ struct MenuSettings {
     //            pushes the switch further out, which is what stops things visibly popping.
     // supersample  render scale in percent. The bluntest clarity gain there is in VR, and the
     //            most expensive - it is the one to back off if the framerate suffers.
-    float detail{2.0f};
+    float detail{4.0f};
     float supersample{120.0f};
 
 };

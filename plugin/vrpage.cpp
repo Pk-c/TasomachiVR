@@ -357,6 +357,7 @@ bool VrPage::build(API::UObject* menu) {
         {HudAlways,   L"HUD always on", nullptr,  0.0f,   1.0f, 1.0f,  true},
         {AirLift,     L"Jump lift",    L"cm",     0.0f,  80.0f, 2.0f,  false},
         {AirForward,  L"Jump forward", L"cm",   -40.0f,  60.0f, 2.0f,  false},
+        {HeadLinger,  L"Head hide after", L"s",   0.0f,   1.5f, 0.1f,  false},
         {Detail,      L"LOD detail",   nullptr,   1.0f,   4.0f, 0.5f,  false},
         {Supersample, L"Supersample",  L"%",     70.0f, 200.0f, 5.0f,  false},
     };
@@ -500,6 +501,7 @@ void VrPage::sync_from(const MenuSettings& live) {
     push(MenuScale, live.menu_size);
     push(AirLift, live.air_lift);
     push(AirForward, live.air_forward);
+    push(HeadLinger, live.head_hide_linger);
     push(Detail, live.detail);
     push(Supersample, live.supersample);
 
@@ -576,6 +578,7 @@ void VrPage::poll(MenuSettings& live) {
     live.menu_size = read(MenuScale, live.menu_size);
     live.air_lift = read(AirLift, live.air_lift);
     live.air_forward = read(AirForward, live.air_forward);
+    live.head_hide_linger = read(HeadLinger, live.head_hide_linger);
     live.detail = read(Detail, live.detail);
     live.supersample = read(Supersample, live.supersample);
 
