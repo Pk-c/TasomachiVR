@@ -594,7 +594,16 @@ void VrPage::poll(MenuSettings& live) {
     };
 
     live.turn_mode = toggle(SmoothTurn, live.turn_mode == 1) ? 1 : 0;
-    live.body_mode = toggle(ShowBody, live.body_mode == 1) ? 1 : 0;
+    // Only a real toggle may change it. The old line wrote 1 or 0 unconditionally, so
+    // BodyMode=2 - the whole character, head included - silently became 0 the first time the
+    // page was opened, without anyone touching the checkbox.
+    {
+        const bool was = live.body_mode == 1;
+        const bool now = toggle(ShowBody, was);
+        if (now != was) {
+            live.body_mode = now ? 1 : 0;
+        }
+    }
     live.hud_always_on = toggle(HudAlways, live.hud_always_on);
 }
 

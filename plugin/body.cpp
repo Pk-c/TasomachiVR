@@ -77,6 +77,7 @@ void set_cast_hidden_shadow(API::UObject* mesh, bool cast) {
     }
 }
 
+
 } // namespace
 
 API::UObject* Body::find_head_mesh(API::UObject* pawn) {
@@ -185,6 +186,19 @@ void Body::apply(API::UObject* pawn, int mode, bool gameplay) {
         break;
 
     case Headless:
+        // A HEAD THAT IS HIDDEN CASTS NO SHADOW EITHER, and that cannot be worked around
+        // here. Hiding a bone collapses its geometry before the renderer knows which view it
+        // is drawing, so it applies to the shadow as much as to the eye.
+        //
+        // A second copy of the character posed by SetMasterPoseComponent does not help: such
+        // a copy is drawn with the MASTER's bone visibility rather than its own. All three
+        // possible orderings were built and tested in game - copy casting, copy visible, and
+        // the visibility set before the slaving rather than after - and the two meshes always
+        // agreed about the head. The near clip plane was tried too and never reached UEVR's
+        // own projection.
+        //
+        // What would work is a copy animated in its own right rather than slaved, which is a
+        // much larger thing and risks a shadow standing idle while you run.
         render_in_main_pass(m_mesh, true);
         hide_bone(m_mesh, kHeadBone);
         break;
@@ -193,6 +207,7 @@ void Body::apply(API::UObject* pawn, int mode, bool gameplay) {
     default: // cutscenes frame the character and need her whole
         render_in_main_pass(m_mesh, true);
         unhide_bone(m_mesh, kHeadBone);
+        set_cast_hidden_shadow(m_mesh, false);
         break;
     }
 

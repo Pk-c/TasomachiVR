@@ -632,6 +632,7 @@ public:
             // by a pad bit, and the remap below clears the very bits it reads.
             m_raw_buttons.store(state->Gamepad.wButtons);
             m_left_trigger.store(state->Gamepad.bLeftTrigger);
+            m_right_trigger.store(state->Gamepad.bRightTrigger);
             // The grip arrives as LeftShoulder - that is what the game binds CamReset to.
             m_left_grip.store((state->Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0);
 
@@ -663,11 +664,20 @@ public:
         // re-raised only from the chosen one, so Interact leaves wherever it was and appears
         // exactly where you asked.
         if (user_index == 0) {
+            // DENIED FIRST, THEN REMAPPED - and the order is the whole point.
+            //
+            // A pad control driving a ButtonEvent is withheld from the game, so it stops
+            // doing whatever the game had on it. But a remap may legitimately re-raise that
+            // very bit from a DIFFERENT control: the right grip carries the stomp, which
+            // costs the game its Run on RightShoulder, and the left stick click gives it
+            // back. Masking last would have wiped exactly that, silently.
+            //
+            // The events read m_raw_buttons, captured before any of this, so masking early
+            // costs them nothing.
+            state->Gamepad.wButtons &= ~m_event_source_mask.load();
             apply_button_remaps(state);
             apply_button_events();
             read_pose_button();
-            // Withheld after the events have read them from the untouched copy above.
-            state->Gamepad.wButtons &= ~m_event_source_mask.load();
         }
 
         if (user_index == 0 && m_config.interact_button != 0) {
@@ -932,6 +942,9 @@ private:
                                  narrow(m_pawn_id).c_str(), narrow(id).c_str());
         }
 
+        // What we are leaving, captured before the name is thrown away.
+        const bool was_free_camera = m_free_camera.load();
+
         m_pawn = pawn;
         m_pawn_id = id;
         // Everything downstream is rebuilt from the new pawn rather than trusted.
@@ -1015,6 +1028,34 @@ private:
                 m_poses.forget();
             }
             m_character = pawn;
+
+            // COMING BACK FROM PHOTO MODE UNDOES A SIT THAT NEVER ENDED.
+            //
+            // The bench raises IsInAction? when you sit down and only lowers it again when
+            // you stand up through its own path. Photo mode takes the character off the
+            // bench without going near that path, so the flag stays raised for good and
+            // every ability that tests it is dead for the rest of the session - which is
+            // exactly the reported symptom.
+            //
+            // The flags to put back are the ones the bindings already name: whatever a
+            // bypass suspends for the length of a call is the same thing left dangling
+            // here. Nothing is invented. If photo mode was entered while standing they are
+            // already at that value and this does nothing.
+            if (was_free_camera) {
+                for (const auto& e : m_events) {
+                    for (const auto& b : e.bypass) {
+                        if (b.on_system || b.name.empty()) {
+                            continue;
+                        }
+                        if (pawn->get_bool_property(b.name) != b.value) {
+                            pawn->set_bool_property(b.name, b.value);
+                            API::get()->log_info("[TasomachiVR] free camera left - %ls put "
+                                                 "back to %d", b.name.c_str(),
+                                                 (int)b.value);
+                        }
+                    }
+                }
+            }
         }
 
         m_flag_age = 0; // re-assert the movement flags immediately on a new pawn
@@ -1371,11 +1412,24 @@ private:
                     break;
                 }
 
+                if (!matched && (from == "LTrigger" || from == "RTrigger")) {
+                    matched = true;
+                    EventBind b{};
+                    b.from_trigger = from == "LTrigger" ? 1 : 2;
+                    b.on_pawn = on_pawn;
+                    b.bypass = bypass;
+                    b.fn.assign(fn.begin(), fn.end());
+                    m_events.push_back(b);
+                    API::get()->log_info("[TasomachiVR] event: %s -> %s%s() (trigger source)",
+                                         from.c_str(), on_pawn ? "pawn." : "", fn.c_str());
+                }
+
                 if (!matched) {
                     const WORD src = xinput_bit(from);
                     if (src == 0) {
                         API::get()->log_error("[TasomachiVR] event: '%s' is neither a VR "
-                                              "button nor a pad button", from.c_str());
+                                              "button, a pad button nor a trigger",
+                                              from.c_str());
                         continue;
                     }
                     EventBind b{};
@@ -1398,7 +1452,11 @@ private:
         for (size_t i = 0; i < m_events.size(); ++i) {
             auto& b = m_events[i];
             bool held;
-            if (b.from_bit != 0) {
+            if (b.from_trigger != 0) {
+                const int pull = b.from_trigger == 1 ? m_left_trigger.load()
+                                                     : m_right_trigger.load();
+                held = pull > m_config.trigger_threshold;
+            } else if (b.from_bit != 0) {
                 held = (raw & b.from_bit) != 0;
             } else {
                 const auto source = b.left ? vr->get_left_joystick_source()
@@ -1748,11 +1806,22 @@ private:
                     break;
                 }
 
+                if (!matched && (from == "LTrigger" || from == "RTrigger")) {
+                    matched = true;
+                    Bound b{};
+                    b.from_trigger = from == "LTrigger" ? 1 : 2;
+                    b.bit = bit;
+                    m_remaps.push_back(b);
+                    API::get()->log_info("[TasomachiVR] remap: %s -> %s (trigger source)",
+                                         from.c_str(), to.c_str());
+                }
+
                 if (!matched) {
                     const WORD src = xinput_bit(from);
                     if (src == 0) {
                         API::get()->log_error("[TasomachiVR] remap: '%s' is neither a VR "
-                                              "button nor an XInput button", from.c_str());
+                                              "button, an XInput button nor a trigger",
+                                              from.c_str());
                         continue;
                     }
                     Bound b{};
@@ -1770,15 +1839,27 @@ private:
         // came in on, and clearing as we go would erase the very thing being tested.
         const WORD raw = state->Gamepad.wButtons;
 
-        for (auto& b : m_remaps) {
-            // BOTH ENDS ARE CLEARED. The source stops doing its old job, and the destination
-            // is driven ONLY by this remap - otherwise the button that natively carried the
-            // destination still fires it, and the ability has been copied rather than moved.
+        // BOTH ENDS OF EVERY ENTRY ARE CLEARED BEFORE ANY IS SET.
+        //
+        // Clearing and setting entry by entry breaks as soon as two sources share one
+        // destination - and two of them do here, since both triggers stand in for Run so that
+        // one can hold it and the other tap it in mid-air. The second entry's clear would
+        // erase the first one's contribution, and only one trigger would ever work.
+        //
+        // The source is cleared so it stops doing its old job; the destination so that it is
+        // driven only from here, which is what makes this a move rather than a copy.
+        for (const auto& b : m_remaps) {
             state->Gamepad.wButtons &= ~b.clear;
             state->Gamepad.wButtons &= ~b.bit;
+        }
 
+        for (auto& b : m_remaps) {
             bool held;
-            if (b.from_bit != 0) {
+            if (b.from_trigger != 0) {
+                const int pull = b.from_trigger == 1 ? m_left_trigger.load()
+                                                     : m_right_trigger.load();
+                held = pull > m_config.trigger_threshold;
+            } else if (b.from_bit != 0) {
                 held = (raw & b.from_bit) != 0;
             } else {
                 const auto source = b.left ? vr->get_left_joystick_source()
@@ -2179,6 +2260,7 @@ private:
             API::get()->log_info("[TasomachiVR] render: screen percentage %.0f",
                                  m_config.supersample);
         }
+
     }
 
     // Trimmed of trailing zeroes, so the file stays as readable as it was written.
@@ -2335,7 +2417,7 @@ private:
     // runtime's business) or an XInput bit of its own - which is what the grips are, since
     // they reach us already translated to the shoulder buttons.
     struct Bound { UEVR_ActionHandle action; bool left; WORD bit; WORD clear;
-                   WORD from_bit; bool was_held; int reports; };
+                   WORD from_bit; int from_trigger; bool was_held; int reports; };
     std::vector<Bound> m_remaps{};
     bool m_remaps_parsed{false};
     // A button that calls a Blueprint event directly. The press is noticed on the input
@@ -2358,7 +2440,9 @@ private:
         std::string cond_anim;
     };
 
-    struct EventBind { UEVR_ActionHandle action; bool left; WORD from_bit;
+    // from_trigger: 0 none, 1 left, 2 right. A trigger is an analogue byte rather than a
+    // bit, so it cannot go through xinput_bit and needs a threshold of its own.
+    struct EventBind { UEVR_ActionHandle action; bool left; WORD from_bit; int from_trigger;
                        bool on_pawn; std::wstring fn;
                        bool was_held; int reports;
                        std::vector<Bypass> bypass; };
@@ -2371,6 +2455,7 @@ private:
     std::atomic<uint16_t> m_raw_buttons{0};
     std::atomic<uint16_t> m_event_source_mask{0};
     std::atomic<int> m_left_trigger{0};
+    std::atomic<int> m_right_trigger{0};
     std::atomic<bool> m_left_grip{false};
     bool m_head_shown{false};
     float m_detail_applied{-1.0f};
