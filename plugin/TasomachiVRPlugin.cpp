@@ -105,7 +105,10 @@ struct Config {
     // Eye height while piloting the boat, REPLACING up_offset rather than adding to it.
     // The boat seats the view differently from the character, so one number cannot serve
     // both - and on foot the answer turned out to be 0, which leaves nothing to build on.
-    float ship_up_offset = -52.0f;
+    float ship_up_offset = -40.0f;
+    // Eye forward while piloting, REPLACING forward_offset. The helm is not where her head
+    // is, so the number that places the eye on foot has no bearing here.
+    float ship_forward_offset = 25.0f;
 
     // 0 = snap, 1 = smooth. Snap is the default: it is the comfortable choice for most
     // people, and smooth turning is the classic way to make someone sick in VR.
@@ -122,8 +125,30 @@ struct Config {
     bool  ship_follow_turn = true;
     // Recentre the view when the possessed pawn changes - boarding, leaving, respawning.
     bool  pawn_recenter = true;
-    // Stick units per degree still to be turned, when steering the boat toward the view.
-    float ship_turn_gain = 0.06f;
+    // The deck turns you with it - see the tick. Off leaves the view pinned to the world
+    // while the hull swings underneath.
+    // Have the view take the hull's heading. OFF: with the stick reaching the boat AND
+    // turning the view, the two already move together, and layering this on top was where
+    // the boat started behaving strangely.
+    bool  ship_carries_view = false;
+    // Take the boat's steering over completely by synthesising its direction vector.
+    //
+    // OFF, after trying it: it made the boat unpredictable. The measurement it rests on -
+    // that the hull points at the angle of the stick vector - held for one sample and does
+    // not describe the whole behaviour, since the hull then drifted back off that angle on
+    // its own. Left in place, off, because the finding is worth keeping and the switch costs
+    // nothing.
+    bool  ship_hijack = false;
+    // Maps our heading onto the stick angle the boat reads. Flip if it steers the wrong way.
+    float ship_stick_sign = 1.0f;
+    // Degrees per second the view may follow the hull. 0 removes the limit.
+    // Degrees per second the view may follow the hull. Measured: normal steering swings
+    // the hull at about 330 deg/s, while the one-frame lurch this guards against is upward of
+    // 6000 - so the limit belongs well above the first and far below the second. At 150 it
+    // throttled ordinary turning and the view lagged the whole way round.
+    float ship_view_follow_max = 720.0f;
+    // Withhold the stick's vertical axis from the boat as well. Starts OFF: it is the
+    // suspect for the steering having stopped, and a control that works matters more.
     float snap_angle     = 45.0f;
     float snap_threshold = 0.5f;
     float snap_release   = 0.3f;
@@ -291,14 +316,22 @@ public:
         if (!m_phase_disabled[4]) {
             drive_vr_page();
         }
-        // THE HULL IS STEERED TOWARD THE VIEW, not nudged by the stick.
+        // THE VIEW TAKES THE HULL'S HEADING, ABSOLUTELY.
         //
-        // Passing the stick through gave the boat an IMPULSE whose size depended on how long
-        // it was held, while a snap turn moves the view by a fixed angle in one frame - so the
-        // two could never agree and the hull always came up short. Reading its heading back
-        // and pushing its own Turn axis until it matches makes the ANGLE the thing they
-        // share, and the boat still steers itself, so it goes on flying along its own nose.
-        if (!m_is_character && m_gameplay.load() && m_config.ship_follow_turn &&
+        // One assignment, not an accumulation. Two earlier shapes of this were wrong in ways
+        // worth writing down: adding the per-frame delta to the view yaw drifted and left the
+        // tracked space pinned to the world, and then rotating UEVR's room anchor to fix that
+        // moved two things at once and became unpredictable.
+        //
+        // Taking the heading outright cannot drift and needs no anchor arithmetic. The view
+        // faces where the character faces - she is standing on the boat, so that is the bow -
+        // and your head still turns freely on top of it. Nothing accumulates, so nothing can
+        // creep out of alignment over a long flight.
+        //
+        // The stick is not part of this at all: it reaches TurnRate and turns the hull, and
+        // the view follows only because the hull moved.
+        if (!m_is_character && m_gameplay.load() && !m_config.ship_hijack &&
+            m_config.ship_carries_view &&
             m_pawn != nullptr) {
             uc::Call get{m_pawn, L"K2_GetActorRotation"};
             if (get.ok) {
@@ -306,15 +339,51 @@ public:
                 m_pawn->process_event(get.fn, get.bytes.data());
                 uc::result(get, now);
 
-                const float error = normalize_deg(m_snap_yaw.load() - now.yaw);
-                float cmd = error * m_config.ship_turn_gain;
-                cmd = cmd < -1.0f ? -1.0f : (cmd > 1.0f ? 1.0f : cmd);
-                // A degree either way is close enough. Asking for less than the boat's own
-                // interpolation can deliver would leave it hunting around the target.
-                m_ship_turn.store(std::fabs(error) < 1.0f ? 0.0f : cmd);
+                // WHICH ONE TURNS? A flip on the first steer could be the hull swinging to a
+                // stale target of its own, or our view taking a heading in the wrong sign
+                // convention - this mod runs yaw_sign at -1 for exactly that reason. The two
+                // are indistinguishable from the seat, so both are written down: the first
+                // few frames aboard, and any single-frame jump big enough to be the flip.
+                // RATE LIMITED, because the hull does not always move like a hull.
+                //
+                // Measured, not supposed: on the first steer after boarding the boat swings
+                // 68 degrees in a single frame and then takes half of it back, before
+                // settling to about 1.3 degrees a frame. That transient is the game's own
+                // code and not something this mod can reach - but there is no reason to pass
+                // it on to the eyes. Following at a bounded rate lets the view ignore a
+                // one-frame lurch that the hull is about to undo anyway, and costs nothing
+                // during normal steering, which is an order of magnitude slower than the cap.
+                //
+                // It converges on the hull rather than accumulating, so nothing can drift.
+                const float previous = m_snap_yaw.load();
+                float step = normalize_deg(normalize_deg(now.yaw) - previous);
+                const float dt = delta > 0.0f ? delta : 0.016f;
+                const float cap = m_config.ship_view_follow_max * dt;
+                const bool clamped = cap > 0.0f && std::fabs(step) > cap;
+                if (clamped) {
+                    step = step > 0.0f ? cap : -cap;
+                }
+                // PITCH AND ROLL ARE LOGGED TOO, and they are the point of this pass.
+                //
+                // The stick's vertical axis has to reach the boat for it to steer at all -
+                // measured - and it brings a movement artefact with it. The spring arm is
+                // collapsed to nothing by the Lua, so an orbit cannot explain it; what is
+                // left is the HULL itself pitching or rolling, carrying the camera with it
+                // while this mod holds the horizon flat. If these two move with the stick,
+                // that is the artefact, and the choice is between following them and damping
+                // what they do to the eye - two very different fixes, so the number decides.
+                if (m_ship_log < 12 || clamped || std::fabs(step) > 0.5f) {
+                    if (m_ship_log < 60) {
+                        ++m_ship_log;
+                        API::get()->log_info("[TasomachiVR] SHIP | yaw=%.1f pitch=%.1f "
+                                             "roll=%.1f view=%.1f step=%.1f%s",
+                                             now.yaw, now.pitch, now.roll, previous, step,
+                                             clamped ? " (capped)" : "");
+                    }
+                }
+                m_snap_yaw.store(normalize_deg(previous + step));
             }
-        } else {
-            m_ship_turn.store(0.0f);
+
         }
 
         m_phase = 5;
@@ -649,6 +718,8 @@ public:
         // stick is copied onto the left, which is what the game reads for MoveForward and
         // MoveRight; the physical left stick is kept aside for our own turning and never
         // reaches the game, so it cannot also walk her sideways.
+        const int16_t raw_rx = state->Gamepad.sThumbRX;
+        const int16_t raw_ry = state->Gamepad.sThumbRY;
         const int16_t phys_lx = state->Gamepad.sThumbLX;
         const int16_t phys_ly = state->Gamepad.sThumbLY;
         if (m_config.swap_sticks && user_index == 0 && !m_vrpage.is_open()) {
@@ -659,14 +730,18 @@ public:
         // Only pad 0 drives turning. Evaluating every index was what made the Lua
         // version of this spin on Europa: the empty pads read as centred and re-armed
         // the trigger between two real samples.
-        // THE STICK TURNS BOTH, ON PURPOSE.
+        // ON THE BOAT THE STICK ONLY STEERS.
         //
-        // On the boat it reaches the game as well - TurnRate is bound to Gamepad_RightX - so
-        // one push swings the hull and turns the view with it. That is the asked-for
-        // behaviour rather than a clash: the boat comes round, and the view comes round with
-        // it because WE turn it, from a snap or a smooth step the player chose. What the view
-        // never does is follow the hull's own motion, which is what made it sickening.
-        if (m_config.snap_turn && user_index == 0 && m_gameplay.load()) {
+        // It does not touch the view there: you are a passenger who can look and walk about
+        // freely, and the wheel turns the boat under you rather than swinging you with it.
+        // That also settles the mismatch this went through several shapes to solve - if the
+        // view never turns from the stick, there is no angle left for the hull to match.
+        const bool own_turn = m_on_foot.load() || !m_config.ship_follow_turn;
+
+        // On the boat the stick drives our heading too now - see the hijack below. It is
+        // no longer the boat's steering, it is the wheel we hold.
+        if (m_config.snap_turn && (own_turn || m_config.ship_hijack) && user_index == 0 &&
+            m_gameplay.load()) {
             const float axis = m_config.swap_sticks ? (phys_lx / 32767.0f)
                                                     : (state->Gamepad.sThumbRX / 32767.0f);
             const float mag = std::fabs(axis);
@@ -702,16 +777,84 @@ public:
         //
         // On foot the stick still goes nowhere near the game: there it would fight the head
         // through ControlRotation every frame, which is what it was withheld for.
-        // The player's stick never reaches the game, on foot or afloat - it is ours and it
-        // moves the view. What the boat receives instead is the servo above: an axis
-        // synthesised from the ANGLE still to be made up, which is why the hull now ends
-        // where the view does rather than wherever a push happened to leave it.
-        if ((m_config.snap_turn || m_config.swap_sticks) && m_gameplay.load()) {
-            state->Gamepad.sThumbRX = 0;
+        // Withheld on foot, where it would fight the head through ControlRotation every
+        // frame. On the boat it goes straight through to TurnRate, which is the wheel.
+        // THE VERTICAL AXIS IS WITHHELD EVERYWHERE, and that is not a detail. Both pawns
+        // bind it to LookUp and LookUpRate, so pushing the stick forward pitched the view -
+        // on the boat it was reaching the game untouched, because the block below only ever
+        // ran where our own turn does. Pitch belongs to the neck and to nothing else.
+        // THE VERTICAL AXIS: withheld on foot, and on the boat only if asked.
+        //
+        // Measured, and it is the one correlation the logs offer: while this axis still
+        // reached the game the hull turned, and from the build that cut it the hull has not
+        // moved a degree - with the horizontal axis leaving this hook untouched at full
+        // deflection the whole time. So this boat appears to be steered through both axes,
+        // not just the one bound to TurnRate.
+        //
+        // On foot it stays withheld unconditionally: there it pitches the view through
+        // LookUp, and pitch belongs to the neck.
+        // NULLIFIED OUTRIGHT, and no longer conditional on the turn settings.
+        //
+        // It used to hang off snap_turn - an unrelated option - so setting SnapTurn=0 would
+        // have quietly let this axis through again. Nothing about withholding the pitch has
+        // anything to do with how turning is done, so the two are no longer tied together.
+        // ON THE BOAT THE RIGHT STICK IS A DIRECTION, AND MUST ARRIVE INTACT.
+        //
+        // Measured, and it overturns everything that was assumed here: the hull points itself
+        // at the ANGLE of the stick vector. Pushed to 69 degrees off forward, the hull went to
+        // 68.2 in a single frame. It is an absolute heading control, not a rate.
+        //
+        // Which explains every symptom at once. Pushing right alone did nothing because its
+        // magnitude was 35 per cent, under the boat's own deadzone - not because an axis was
+        // missing. A nudge forward only served to clear that deadzone. And pushing fully back
+        // asks for a heading of 180 degrees, so the hull obliged: the "flip" was the order
+        // being given.
+        //
+        // Scaling the vertical axis, which is what this code used to do, therefore CORRUPTED
+        // the steering - halving y turned a request for 69 degrees into one for 79. Both ends
+        // of the stick reach the boat untouched now. On foot the vertical axis is still
+        // withheld, where it pitches the view and belongs to the neck alone.
+        if (m_gameplay.load() && (m_on_foot.load() || m_config.ship_hijack)) {
             state->Gamepad.sThumbRY = 0;
         }
-        if (!m_on_foot.load() && m_gameplay.load() && m_config.ship_follow_turn) {
-            state->Gamepad.sThumbRX = static_cast<int16_t>(m_ship_turn.load() * 32767.0f);
+
+        // THE BOAT'S CONTROLS, TAKEN OVER ENTIRELY.
+        //
+        // Measured: the hull points itself at the ANGLE of the right stick vector, absolutely
+        // - pushed to 69 degrees off forward it went to -68.2. So the stick is a direction,
+        // and every attempt to tame it by touching one axis distorted that direction instead.
+        //
+        // So the player's stick no longer reaches the boat at all. It turns OUR heading, by
+        // snap steps or smoothly, exactly as it does on foot; and a vector pointing at that
+        // heading is synthesised for the boat, at full magnitude so it clears the deadzone
+        // that made a modest push do nothing. The result is the only thing that was ever
+        // wanted here: the stick turns the boat about its vertical axis and does nothing else.
+        // No pitch, no camera movement, because the player's vertical push is gone.
+        if (!m_on_foot.load() && m_gameplay.load() && m_config.ship_hijack) {
+            const float h = m_snap_yaw.load() * m_config.ship_stick_sign * kDegToRad;
+            state->Gamepad.sThumbRX = static_cast<int16_t>(-std::sin(h) * 32000.0f);
+            state->Gamepad.sThumbRY = static_cast<int16_t>(-std::cos(h) * 32000.0f);
+        }
+        if ((m_config.snap_turn || m_config.swap_sticks) && own_turn && m_gameplay.load()) {
+            state->Gamepad.sThumbRX = 0;
+        }
+
+        // WHAT ACTUALLY LEAVES THIS HOOK. Everything above says the stick should reach the
+        // boat, and it does not steer - so the next thing to establish is whether the value
+        // survives to the game at all. Reported only while the stick is genuinely pushed,
+        // and only a handful of times, so it cannot bury the log.
+        // BOTH AXES, RAW AND AS THEY LEAVE. The measurements and the description of what the
+        // hands are doing disagree: pushing left and right is what steers, yet the hull only
+        // moves while the VERTICAL axis is allowed through, with the horizontal one observed
+        // leaving this hook untouched at full deflection. The one explanation that fits both
+        // is that the two arrive swapped, so this reports them together and settles it.
+        if (user_index == 0 && !m_on_foot.load() && m_gameplay.load() &&
+            (std::abs(raw_rx) > 8000 || std::abs(raw_ry) > 8000) && m_stick_reports < 14) {
+            ++m_stick_reports;
+            API::get()->log_info("[TasomachiVR] STICK | in x=%d y=%d | out x=%d y=%d",
+                                 (int)raw_rx, (int)raw_ry,
+                                 (int)state->Gamepad.sThumbRX,
+                                 (int)state->Gamepad.sThumbRY);
         }
 
         // Unused otherwise; silences the compiler when the swap is off.
@@ -952,7 +1095,10 @@ public:
         // jump animation tucks the character, and the chest comes up and FORWARD into a
         // viewpoint that never moved - height alone does not always clear it.
         const float blend = m_air_blend.load();
-        const float forward = m_config.forward_offset + m_config.eye_air_forward * blend;
+        // The boat seats the view somewhere else entirely, so it carries its own pair.
+        const float base_forward =
+            m_is_character ? m_config.forward_offset : m_config.ship_forward_offset;
+        const float forward = base_forward + m_config.eye_air_forward * blend;
 
         const float r = m_final_yaw.load() * kDegToRad;
         position->x += std::cos(r) * forward;
@@ -1001,6 +1147,7 @@ private:
         s.forward_offset = m_config.forward_offset;
         s.up_offset      = m_config.up_offset;
         s.ship_up_offset = m_config.ship_up_offset;
+        s.ship_forward_offset = m_config.ship_forward_offset;
         s.yaw_offset     = m_config.yaw_offset;
         s.pause_button   = m_config.pause_button;
         s.body_mode      = m_config.body_mode;
@@ -1022,6 +1169,7 @@ private:
         m_config.forward_offset = s.forward_offset;
         m_config.up_offset      = s.up_offset;
         m_config.ship_up_offset = s.ship_up_offset;
+        m_config.ship_forward_offset = s.ship_forward_offset;
         m_config.yaw_offset     = s.yaw_offset;
         m_config.body_mode      = s.body_mode;
         m_config.menu_size      = s.menu_size;
@@ -1118,6 +1266,7 @@ private:
         if (m_config.pawn_recenter) {
             m_recenter_wait = 20;
         }
+        m_ship_log = 0;   // the first frames aboard are the interesting ones
 
         // FACING THE BOW ON BOARDING. The view yaw is ours and survives the possession, so
         // stepping onto the boat left it pointing wherever the character had last been turned
@@ -1186,7 +1335,24 @@ private:
         // setting rather than a build.
         if (m_pawn_playable && !m_config.free_camera_pawns.empty()) {
             const std::string name = narrow(m_pawn_name);
-            if (name.find(m_config.free_camera_pawns) != std::string::npos) {
+            // A COMMA-SEPARATED LIST now, not one name. Photo mode was the first pawn to want
+            // its camera back and the boat is the second, and there was no reason for the
+            // setting to hold only one.
+            bool hands_off = false;
+            std::stringstream want(m_config.free_camera_pawns);
+            std::string one;
+            while (std::getline(want, one, ',')) {
+                while (!one.empty() && (one.front() == ' ' || one.front() == 9)) {
+                    one.erase(one.begin());
+                }
+                while (!one.empty() && (one.back() == ' ' || one.back() == 9)) {
+                    one.pop_back();
+                }
+                if (!one.empty() && name.find(one) != std::string::npos) {
+                    hands_off = true;
+                }
+            }
+            if (hands_off) {
                 m_pawn_playable = false;
                 m_free_camera.store(true);
                 API::get()->log_info("[TasomachiVR] %s aims its own camera - handing it back",
@@ -2354,6 +2520,7 @@ private:
             {"ForwardOffset",   format_number(m_config.forward_offset)},
             {"UpOffset",        format_number(m_config.up_offset)},
             {"ShipUpOffset",    format_number(m_config.ship_up_offset)},
+            {"ShipForwardOffset", format_number(m_config.ship_forward_offset)},
             {"YawOffset",       format_number(m_config.yaw_offset)},
             {"BodyMode",        std::to_string(m_config.body_mode)},
             {"MenuSize",        format_number(m_config.menu_size)},
@@ -2536,11 +2703,19 @@ private:
             else if (key == "ForwardOffset") m_config.forward_offset = (float)std::atof(value.c_str());
             else if (key == "UpOffset")      m_config.up_offset = (float)std::atof(value.c_str());
             else if (key == "ShipUpOffset")  m_config.ship_up_offset = (float)std::atof(value.c_str());
+            else if (key == "ShipForwardOffset")
+                m_config.ship_forward_offset = (float)std::atof(value.c_str());
             else if (key == "SnapTurn")      m_config.snap_turn = std::atoi(value.c_str()) != 0;
             else if (key == "ShipRoomscale") m_config.ship_roomscale = std::atoi(value.c_str()) != 0;
             else if (key == "ShipFollowTurn") m_config.ship_follow_turn = std::atoi(value.c_str()) != 0;
             else if (key == "PawnRecenter")  m_config.pawn_recenter = std::atoi(value.c_str()) != 0;
-            else if (key == "ShipTurnGain")  m_config.ship_turn_gain = (float)std::atof(value.c_str());
+            else if (key == "ShipViewFollowMax")
+                m_config.ship_view_follow_max = (float)std::atof(value.c_str());
+            else if (key == "ShipHijack")    m_config.ship_hijack = std::atoi(value.c_str()) != 0;
+            else if (key == "ShipStickSign")
+                m_config.ship_stick_sign = (float)std::atof(value.c_str());
+            else if (key == "ShipCarriesView")
+                m_config.ship_carries_view = std::atoi(value.c_str()) != 0;
             else if (key == "UevrRoomscale") m_config.uevr_roomscale = std::atoi(value.c_str()) != 0;
             else if (key == "SnapAngle")     m_config.snap_angle = (float)std::atof(value.c_str());
             else if (key == "SnapThreshold") m_config.snap_threshold = (float)std::atof(value.c_str());
@@ -2601,9 +2776,10 @@ private:
     std::atomic<bool>  m_free_camera{false};
     // Mirrors m_is_character for the XInput callback, which runs on another thread.
     std::atomic<bool>  m_on_foot{false};
+    int  m_stick_reports{0};
     bool m_roomscale_on{true};
     int  m_recenter_wait{0};
-    std::atomic<float> m_ship_turn{0.0f};
+    int  m_ship_log{0};
     // Presses counted on the input thread, spent on the game thread. A counter rather than
     // a flag so a quick double tap moves two poses instead of one.
     std::atomic<unsigned> m_pose_requests{0};

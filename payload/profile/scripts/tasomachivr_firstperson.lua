@@ -20,6 +20,28 @@
 
 local api = uevr.api
 
+--- Pawns whose camera boom must be LEFT ALONE.
+---
+--- Collapsing the boom is what turns a third person camera into a head, and it is right for
+--- the character. The flying boat is a different matter: its camera works nothing like hers,
+--- and every attempt to make a head of it failed - the view had to follow the hull, and each
+--- mechanism built to make that happen fought the boat's own camera instead. So the boat keeps
+--- its boom and is flown in third person, with the headset laid on top. The plugin hands the
+--- rest back at the same time; see FreeCameraPawns in the ini.
+local kKeepBoom = { "Plane" }
+
+local function keeps_its_boom(name)
+    if name == nil then
+        return false
+    end
+    for _, want in ipairs(kKeepBoom) do
+        if string.find(name, want, 1, true) ~= nil then
+            return true
+        end
+    end
+    return false
+end
+
 local state = {
     pawn = nil,
     booms = nil,
@@ -126,6 +148,13 @@ local function refresh_pawn()
     end
 
     state.pawn = pawn
+
+    local full = try(function() return pawn:get_full_name() end)
+    if keeps_its_boom(full) then
+        state.booms = nil   -- flown in third person; nothing of ours belongs here
+        return
+    end
+
     state.booms = components_of_class(pawn, "Class /Script/Engine.SpringArmComponent")
 end
 

@@ -73,6 +73,7 @@ private:
         EyeForward,
         EyeHeight,
         ShipHeight,
+        ShipForward,
         // YawTrim is still a setting in the ini; it just does not earn a row on a page you
         // read in a headset - it is set once, if ever.
         ShowBody,

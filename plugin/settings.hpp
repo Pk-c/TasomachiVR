@@ -17,7 +17,10 @@ struct MenuSettings {
     float up_offset{0.0f};
     // Eye height while piloting the boat, in place of up_offset. On the page for the same
     // reason as the rest of the offsets: it is judged from the pilot's seat, in a headset.
-    float ship_up_offset{-52.0f};
+    float ship_up_offset{-40.0f};
+    // Eye forward while piloting, in place of forward_offset. On the page for the same reason
+    // as its pair: it is judged from the pilot's seat.
+    float ship_forward_offset{25.0f};
     float yaw_offset{0.0f};
     int   pause_button{3};
     int   body_mode{1};       // 0 whole mesh hidden, 1 headless body
