@@ -102,13 +102,6 @@ struct Config {
     // Pushes the eye out of the skull. Both are hot-reloaded from the ini.
     float forward_offset = 25.0f;
     float up_offset      = 0.0f;
-    // Eye height while piloting the boat, REPLACING up_offset rather than adding to it.
-    // The boat seats the view differently from the character, so one number cannot serve
-    // both - and on foot the answer turned out to be 0, which leaves nothing to build on.
-    float ship_up_offset = -40.0f;
-    // Eye forward while piloting, REPLACING forward_offset. The helm is not where her head
-    // is, so the number that places the eye on foot has no bearing here.
-    float ship_forward_offset = 25.0f;
 
     // 0 = snap, 1 = smooth. Snap is the default: it is the comfortable choice for most
     // people, and smooth turning is the classic way to make someone sick in VR.
@@ -1095,29 +1088,15 @@ public:
         // jump animation tucks the character, and the chest comes up and FORWARD into a
         // viewpoint that never moved - height alone does not always clear it.
         const float blend = m_air_blend.load();
-        // The boat seats the view somewhere else entirely, so it carries its own pair.
-        const float base_forward =
-            m_is_character ? m_config.forward_offset : m_config.ship_forward_offset;
-        const float forward = base_forward + m_config.eye_air_forward * blend;
+        // One pair of offsets: the boat is flown in third person and never reaches this
+        // code, so a second pair had nothing left to serve.
+        const float forward = m_config.forward_offset + m_config.eye_air_forward * blend;
 
         const float r = m_final_yaw.load() * kDegToRad;
         position->x += std::cos(r) * forward;
         position->y += std::sin(r) * forward;
 
-        // Raised while airborne, eased both ways. The jump animation tucks the character up,
-        // and knees and chest rise into a viewpoint that is otherwise perfectly placed - this
-        // passes over them. It is cosmetic and makes no pretence otherwise.
-        //
-        // Applied HERE now, on the offset that places the eye, rather than to a camera
-        // position of our own: UEVR owns that position, which is what makes its roomscale and
-        // its wall collision work.
-        //
-        // THE BOAT GETS ITS OWN HEIGHT. It is not a Character - it carries a projectile
-        // movement component instead - so it seats the view somewhere else entirely, and a
-        // single number cannot place the eye correctly in both. m_is_character is the
-        // distinction the mod already draws, and it needs no name to match against.
-        const float up = m_is_character ? m_config.up_offset : m_config.ship_up_offset;
-        position->z += up + m_config.eye_air_lift * blend;
+        position->z += m_config.up_offset + m_config.eye_air_lift * blend;
 
         // Kept so the body module can tell how far the view has drifted from the head. This
         // is the only place the FINAL camera position is known - UEVR owns it, and these
@@ -1146,8 +1125,6 @@ private:
         s.turn_deadzone  = m_config.turn_deadzone;
         s.forward_offset = m_config.forward_offset;
         s.up_offset      = m_config.up_offset;
-        s.ship_up_offset = m_config.ship_up_offset;
-        s.ship_forward_offset = m_config.ship_forward_offset;
         s.yaw_offset     = m_config.yaw_offset;
         s.pause_button   = m_config.pause_button;
         s.body_mode      = m_config.body_mode;
@@ -1168,8 +1145,6 @@ private:
         m_config.smooth_speed   = s.smooth_speed;
         m_config.forward_offset = s.forward_offset;
         m_config.up_offset      = s.up_offset;
-        m_config.ship_up_offset = s.ship_up_offset;
-        m_config.ship_forward_offset = s.ship_forward_offset;
         m_config.yaw_offset     = s.yaw_offset;
         m_config.body_mode      = s.body_mode;
         m_config.menu_size      = s.menu_size;
@@ -2519,8 +2494,6 @@ private:
             {"SmoothTurnSpeed", format_number(m_config.smooth_speed)},
             {"ForwardOffset",   format_number(m_config.forward_offset)},
             {"UpOffset",        format_number(m_config.up_offset)},
-            {"ShipUpOffset",    format_number(m_config.ship_up_offset)},
-            {"ShipForwardOffset", format_number(m_config.ship_forward_offset)},
             {"YawOffset",       format_number(m_config.yaw_offset)},
             {"BodyMode",        std::to_string(m_config.body_mode)},
             {"MenuSize",        format_number(m_config.menu_size)},
@@ -2702,9 +2675,6 @@ private:
             else if (key == "WriteViewRot")  m_config.write_view_rot = std::atoi(value.c_str()) != 0;
             else if (key == "ForwardOffset") m_config.forward_offset = (float)std::atof(value.c_str());
             else if (key == "UpOffset")      m_config.up_offset = (float)std::atof(value.c_str());
-            else if (key == "ShipUpOffset")  m_config.ship_up_offset = (float)std::atof(value.c_str());
-            else if (key == "ShipForwardOffset")
-                m_config.ship_forward_offset = (float)std::atof(value.c_str());
             else if (key == "SnapTurn")      m_config.snap_turn = std::atoi(value.c_str()) != 0;
             else if (key == "ShipRoomscale") m_config.ship_roomscale = std::atoi(value.c_str()) != 0;
             else if (key == "ShipFollowTurn") m_config.ship_follow_turn = std::atoi(value.c_str()) != 0;
