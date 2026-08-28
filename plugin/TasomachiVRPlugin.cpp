@@ -102,6 +102,10 @@ struct Config {
     // Pushes the eye out of the skull. Both are hot-reloaded from the ini.
     float forward_offset = 25.0f;
     float up_offset      = 0.0f;
+    // Eye height while piloting the boat, REPLACING up_offset rather than adding to it.
+    // The boat seats the view differently from the character, so one number cannot serve
+    // both - and on foot the answer turned out to be 0, which leaves nothing to build on.
+    float ship_up_offset = -52.0f;
 
     // 0 = snap, 1 = smooth. Snap is the default: it is the comfortable choice for most
     // people, and smooth turning is the classic way to make someone sick in VR.
@@ -110,6 +114,16 @@ struct Config {
     float turn_deadzone  = 0.2f;
 
     bool  snap_turn      = true;
+    // UEVR's roomscale movement, which drags the PAWN about to follow your physical body.
+    // Wanted on foot, unwanted on the boat - see the tick for why.
+    bool  uevr_roomscale = true;
+    bool  ship_roomscale = false;
+    // Let the boat have the right stick, so it steers itself and flies along its own nose.
+    bool  ship_follow_turn = true;
+    // Recentre the view when the possessed pawn changes - boarding, leaving, respawning.
+    bool  pawn_recenter = true;
+    // Stick units per degree still to be turned, when steering the boat toward the view.
+    float ship_turn_gain = 0.06f;
     float snap_angle     = 45.0f;
     float snap_threshold = 0.5f;
     float snap_release   = 0.3f;
@@ -155,12 +169,12 @@ struct Config {
     float hud_counter_fade = 8.0f;
     bool  hud_always_on  = false;
 
-    float eye_air_lift = 36.0f;
+    float eye_air_lift = 40.0f;
     float eye_air_forward = 0.0f;
     float detail = 4.0f;
     float supersample = 120.0f;
     // Centimetres from the head at which her head is drawn again. 0 = never.
-    float head_reveal = 45.0f;
+    float head_reveal = 18.0f;
     // Withhold both triggers from the game - they only drive its camera zoom.
     // Substring of a pawn class path that aims its own camera; empty disables this.
     std::string free_camera_pawns{"PhotoMode"};
@@ -277,8 +291,40 @@ public:
         if (!m_phase_disabled[4]) {
             drive_vr_page();
         }
+        // THE HULL IS STEERED TOWARD THE VIEW, not nudged by the stick.
+        //
+        // Passing the stick through gave the boat an IMPULSE whose size depended on how long
+        // it was held, while a snap turn moves the view by a fixed angle in one frame - so the
+        // two could never agree and the hull always came up short. Reading its heading back
+        // and pushing its own Turn axis until it matches makes the ANGLE the thing they
+        // share, and the boat still steers itself, so it goes on flying along its own nose.
+        if (!m_is_character && m_gameplay.load() && m_config.ship_follow_turn &&
+            m_pawn != nullptr) {
+            uc::Call get{m_pawn, L"K2_GetActorRotation"};
+            if (get.ok) {
+                UEVR_Rotatorf now{};
+                m_pawn->process_event(get.fn, get.bytes.data());
+                uc::result(get, now);
+
+                const float error = normalize_deg(m_snap_yaw.load() - now.yaw);
+                float cmd = error * m_config.ship_turn_gain;
+                cmd = cmd < -1.0f ? -1.0f : (cmd > 1.0f ? 1.0f : cmd);
+                // A degree either way is close enough. Asking for less than the boat's own
+                // interpolation can deliver would leave it hunting around the target.
+                m_ship_turn.store(std::fabs(error) < 1.0f ? 0.0f : cmd);
+            }
+        } else {
+            m_ship_turn.store(0.0f);
+        }
+
         m_phase = 5;
         push_render_settings();
+
+        if (m_recenter_wait > 0 && --m_recenter_wait == 0 && m_gameplay.load()) {
+            API::VR::recenter_view();
+            API::get()->log_info("[TasomachiVR] view recentred on the new pawn (%s)",
+                                 m_is_character ? "on foot" : "boat");
+        }
 
         m_phase = 6;
         if (!m_phase_disabled[6]) {
@@ -538,7 +584,15 @@ public:
             body_mode = 2;   // Body::Whole
         }
 
-        if (body_mode == 1 && m_cam_known.load() && m_config.head_reveal > 0.0f) {
+        // NEAR HIDES, FAR REVEALS - and it now decides in both directions.
+        //
+        // It used to run only when the mode was already Headless, so it could reveal a hidden
+        // head but never hide a shown one. With the head shown by default on the ground, and
+        // on the ship where there is no jump to key off, that left nothing to hide it when you
+        // lean into the character. The rule owns the choice now: close means hidden, far means
+        // whole, with the same hysteresis band as before.
+        if ((body_mode == 1 || body_mode == 2) && m_cam_known.load() &&
+            m_config.head_reveal > 0.0f) {
             auto* mesh = deref_object(m_pawn, L"Mesh");
             if (mesh == nullptr) {
                 mesh = deref_object(m_pawn, L"SK_Pc_01");
@@ -556,9 +610,7 @@ public:
                 } else if (away < off) {
                     m_head_shown = false;
                 }
-                if (m_head_shown) {
-                    body_mode = 2;   // Body::Whole
-                }
+                body_mode = m_head_shown ? 2 : 1;
             }
         }
         m_body.apply(m_pawn, body_mode, m_gameplay.load());
@@ -607,6 +659,13 @@ public:
         // Only pad 0 drives turning. Evaluating every index was what made the Lua
         // version of this spin on Europa: the empty pads read as centred and re-armed
         // the trigger between two real samples.
+        // THE STICK TURNS BOTH, ON PURPOSE.
+        //
+        // On the boat it reaches the game as well - TurnRate is bound to Gamepad_RightX - so
+        // one push swings the hull and turns the view with it. That is the asked-for
+        // behaviour rather than a clash: the boat comes round, and the view comes round with
+        // it because WE turn it, from a snap or a smooth step the player chose. What the view
+        // never does is follow the hull's own motion, which is what made it sickening.
         if (m_config.snap_turn && user_index == 0 && m_gameplay.load()) {
             const float axis = m_config.swap_sticks ? (phys_lx / 32767.0f)
                                                     : (state->Gamepad.sThumbRX / 32767.0f);
@@ -635,9 +694,24 @@ public:
         // costs nothing.
         // Same rule: the right stick is only withheld while this mod is driving the view.
         // A cutscene does not read it, and photo mode aims with it.
+        //
+        // THE BOAT KEEPS ITS STICK. It steers on the Turn axis and flies along ITS OWN
+        // forward, so its heading and its travel are the same thing by construction - stand
+        // at the helm and everything lines up. Writing its rotation from our side turned the
+        // hull while it went on flying its own heading, which is what stopped making sense.
+        //
+        // On foot the stick still goes nowhere near the game: there it would fight the head
+        // through ControlRotation every frame, which is what it was withheld for.
+        // The player's stick never reaches the game, on foot or afloat - it is ours and it
+        // moves the view. What the boat receives instead is the servo above: an axis
+        // synthesised from the ANGLE still to be made up, which is why the hull now ends
+        // where the view does rather than wherever a push happened to leave it.
         if ((m_config.snap_turn || m_config.swap_sticks) && m_gameplay.load()) {
             state->Gamepad.sThumbRX = 0;
             state->Gamepad.sThumbRY = 0;
+        }
+        if (!m_on_foot.load() && m_gameplay.load() && m_config.ship_follow_turn) {
+            state->Gamepad.sThumbRX = static_cast<int16_t>(m_ship_turn.load() * 32767.0f);
         }
 
         // Unused otherwise; silences the compiler when the swap is off.
@@ -670,7 +744,13 @@ public:
             // The grip arrives as LeftShoulder - that is what the game binds CamReset to.
             m_left_grip.store((state->Gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0);
 
-            if (m_config.block_triggers && m_gameplay.load()) {
+            // ON FOOT ONLY. The triggers are denied to the character because the game
+            // puts CamZoomIN and CamZoomOUT on them, and they zoom a third-person camera this
+            // mod removed. The BOAT is a different matter entirely: they are its MoveUp axis,
+            // right for up and left for down, and taking them away left it unable to climb or
+            // descend at all. Photo mode's camera needs them for the same reason, and is
+            // already covered by the gameplay test.
+            if (m_config.block_triggers && m_gameplay.load() && m_on_foot.load()) {
                 state->Gamepad.bLeftTrigger = 0;
                 state->Gamepad.bRightTrigger = 0;
             }
@@ -838,6 +918,13 @@ public:
         // of it is gone. The eye is placed by the offsets in the post callback instead.
         (void)position;
 
+        // THE VIEW IS OURS ON THE BOAT TOO, and that is not a detail.
+        //
+        // Handing the rotation back to the game there was tried and is a mistake: the boat's
+        // camera hangs off a spring arm and rides the hull, so the view is dragged around by
+        // something the player did not do. On a monitor that reads as weight; in a headset it
+        // is a yaw nobody asked for, and it is sickening. A free head is not a preference
+        // here, it is the difference between playable and not.
         if (rotation == nullptr || !m_config.write_view_rot) {
             return;
         }
@@ -878,7 +965,13 @@ public:
         // Applied HERE now, on the offset that places the eye, rather than to a camera
         // position of our own: UEVR owns that position, which is what makes its roomscale and
         // its wall collision work.
-        position->z += m_config.up_offset + m_config.eye_air_lift * blend;
+        //
+        // THE BOAT GETS ITS OWN HEIGHT. It is not a Character - it carries a projectile
+        // movement component instead - so it seats the view somewhere else entirely, and a
+        // single number cannot place the eye correctly in both. m_is_character is the
+        // distinction the mod already draws, and it needs no name to match against.
+        const float up = m_is_character ? m_config.up_offset : m_config.ship_up_offset;
+        position->z += up + m_config.eye_air_lift * blend;
 
         // Kept so the body module can tell how far the view has drifted from the head. This
         // is the only place the FINAL camera position is known - UEVR owns it, and these
@@ -907,6 +1000,7 @@ private:
         s.turn_deadzone  = m_config.turn_deadzone;
         s.forward_offset = m_config.forward_offset;
         s.up_offset      = m_config.up_offset;
+        s.ship_up_offset = m_config.ship_up_offset;
         s.yaw_offset     = m_config.yaw_offset;
         s.pause_button   = m_config.pause_button;
         s.body_mode      = m_config.body_mode;
@@ -927,6 +1021,7 @@ private:
         m_config.smooth_speed   = s.smooth_speed;
         m_config.forward_offset = s.forward_offset;
         m_config.up_offset      = s.up_offset;
+        m_config.ship_up_offset = s.ship_up_offset;
         m_config.yaw_offset     = s.yaw_offset;
         m_config.body_mode      = s.body_mode;
         m_config.menu_size      = s.menu_size;
@@ -1007,6 +1102,58 @@ private:
         // on any pawn the game adds later.
         m_cmc = deref_object(pawn, L"CharacterMovement");
         m_is_character = m_cmc != nullptr;
+        m_on_foot.store(m_is_character);   // read from the input thread
+
+        // FACING THE WAY THE NEW PAWN FACES.
+        //
+        // The rotation offset carries whatever snap turns were made before boarding, so
+        // stepping onto the boat left the view pointing off the bow while the hull flew
+        // straight ahead - and since the boat now owns its own heading, nothing was left to
+        // reconcile the two. A recentre sets that offset from where you are actually looking,
+        // which puts the world's forward back under the game's camera - the bow.
+        //
+        // Deferred a few frames: the possession has happened but the game's camera has not
+        // settled on the new pawn yet, and recentring against the old one would bake in the
+        // very error this removes.
+        if (m_config.pawn_recenter) {
+            m_recenter_wait = 20;
+        }
+
+        // FACING THE BOW ON BOARDING. The view yaw is ours and survives the possession, so
+        // stepping onto the boat left it pointing wherever the character had last been turned
+        // - as often as not straight back down the deck. The hull's own heading is the only
+        // sensible thing to adopt, and taking it here leaves the servo nothing to correct on
+        // the first frame either.
+        if (!m_is_character && pawn != nullptr) {
+            uc::Call get{pawn, L"K2_GetActorRotation"};
+            if (get.ok) {
+                UEVR_Rotatorf now{};
+                pawn->process_event(get.fn, get.bytes.data());
+                uc::result(get, now);
+                m_snap_yaw.store(normalize_deg(now.yaw));
+                API::get()->log_info("[TasomachiVR] boarded: view set to the bow (%.0f)",
+                                     now.yaw);
+            }
+        }
+
+        // ROOMSCALE MOVEMENT IS FOR A CHARACTER, NOT FOR A VEHICLE.
+        //
+        // UEVR's roomscale moves the POSSESSED PAWN so the world keeps up with your physical
+        // body - which is exactly right on foot, and is what gives this mod its wall
+        // collision. On the boat the possessed pawn IS the boat, so turning on the spot and
+        // then pushing forward drags the hull about, and the boat noses into wherever it has
+        // been dragged. That is the 180 that broke the opening: nothing was steering it, it
+        // was being carried.
+        //
+        // Nothing else changes - the snap turn, the stick and the view stay as they are on
+        // foot. Only the pawn stops being towed by your body.
+        const bool want = m_is_character ? m_config.uevr_roomscale : m_config.ship_roomscale;
+        if (want != m_roomscale_on) {
+            m_roomscale_on = want;
+            API::VR::set_mod_value("VR_RoomscaleMovement", want);
+            API::get()->log_info("[TasomachiVR] roomscale movement %s (%s)",
+                                 want ? "on" : "off", m_is_character ? "on foot" : "boat");
+        }
 
         if (auto* klass = pawn->get_class(); klass != nullptr) {
             m_pawn_name = klass->get_full_name();
@@ -2206,6 +2353,7 @@ private:
             {"SmoothTurnSpeed", format_number(m_config.smooth_speed)},
             {"ForwardOffset",   format_number(m_config.forward_offset)},
             {"UpOffset",        format_number(m_config.up_offset)},
+            {"ShipUpOffset",    format_number(m_config.ship_up_offset)},
             {"YawOffset",       format_number(m_config.yaw_offset)},
             {"BodyMode",        std::to_string(m_config.body_mode)},
             {"MenuSize",        format_number(m_config.menu_size)},
@@ -2387,7 +2535,13 @@ private:
             else if (key == "WriteViewRot")  m_config.write_view_rot = std::atoi(value.c_str()) != 0;
             else if (key == "ForwardOffset") m_config.forward_offset = (float)std::atof(value.c_str());
             else if (key == "UpOffset")      m_config.up_offset = (float)std::atof(value.c_str());
+            else if (key == "ShipUpOffset")  m_config.ship_up_offset = (float)std::atof(value.c_str());
             else if (key == "SnapTurn")      m_config.snap_turn = std::atoi(value.c_str()) != 0;
+            else if (key == "ShipRoomscale") m_config.ship_roomscale = std::atoi(value.c_str()) != 0;
+            else if (key == "ShipFollowTurn") m_config.ship_follow_turn = std::atoi(value.c_str()) != 0;
+            else if (key == "PawnRecenter")  m_config.pawn_recenter = std::atoi(value.c_str()) != 0;
+            else if (key == "ShipTurnGain")  m_config.ship_turn_gain = (float)std::atof(value.c_str());
+            else if (key == "UevrRoomscale") m_config.uevr_roomscale = std::atoi(value.c_str()) != 0;
             else if (key == "SnapAngle")     m_config.snap_angle = (float)std::atof(value.c_str());
             else if (key == "SnapThreshold") m_config.snap_threshold = (float)std::atof(value.c_str());
             else if (key == "SnapRelease")   m_config.snap_release = (float)std::atof(value.c_str());
@@ -2445,6 +2599,11 @@ private:
     // its own camera is up. Atomic because the input thread reads it to decide whether the
     // pose button is ours this frame.
     std::atomic<bool>  m_free_camera{false};
+    // Mirrors m_is_character for the XInput callback, which runs on another thread.
+    std::atomic<bool>  m_on_foot{false};
+    bool m_roomscale_on{true};
+    int  m_recenter_wait{0};
+    std::atomic<float> m_ship_turn{0.0f};
     // Presses counted on the input thread, spent on the game thread. A counter rather than
     // a flag so a quick double tap moves two poses instead of one.
     std::atomic<unsigned> m_pose_requests{0};

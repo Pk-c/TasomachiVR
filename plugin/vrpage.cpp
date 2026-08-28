@@ -352,6 +352,7 @@ bool VrPage::build(API::UObject* menu) {
         {SmoothSpeed, L"Turn speed",   L"deg/s", 30.0f, 240.0f, 5.0f,  false},
         {EyeForward,  L"Eye forward",  L"cm",   -10.0f,  40.0f, 1.0f,  false},
         {EyeHeight,   L"Eye height",   L"cm",   -15.0f,  15.0f, 1.0f,  false},
+        {ShipHeight,  L"Ship height",  L"cm",   -80.0f,  20.0f, 2.0f,  false},
         {ShowBody,    L"Show body",    nullptr,   0.0f,   1.0f, 1.0f,  true},
         {MenuScale,   L"Menu size",    nullptr,   0.6f,   2.5f, 0.1f,  false},
         {HudAlways,   L"HUD always on", nullptr,  0.0f,   1.0f, 1.0f,  true},
@@ -498,6 +499,7 @@ void VrPage::sync_from(const MenuSettings& live) {
     push(SmoothSpeed, live.smooth_speed);
     push(EyeForward, live.forward_offset);
     push(EyeHeight, live.up_offset);
+    push(ShipHeight, live.ship_up_offset);
     push(MenuScale, live.menu_size);
     push(AirLift, live.air_lift);
     push(AirForward, live.air_forward);
@@ -575,6 +577,7 @@ void VrPage::poll(MenuSettings& live) {
     live.smooth_speed = read(SmoothSpeed, live.smooth_speed);
     live.forward_offset = read(EyeForward, live.forward_offset);
     live.up_offset = read(EyeHeight, live.up_offset);
+    live.ship_up_offset = read(ShipHeight, live.ship_up_offset);
     live.menu_size = read(MenuScale, live.menu_size);
     live.air_lift = read(AirLift, live.air_lift);
     live.air_forward = read(AirForward, live.air_forward);

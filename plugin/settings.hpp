@@ -15,6 +15,9 @@ struct MenuSettings {
     float turn_deadzone{0.2f};
     float forward_offset{25.0f};
     float up_offset{0.0f};
+    // Eye height while piloting the boat, in place of up_offset. On the page for the same
+    // reason as the rest of the offsets: it is judged from the pilot's seat, in a headset.
+    float ship_up_offset{-52.0f};
     float yaw_offset{0.0f};
     int   pause_button{3};
     int   body_mode{1};       // 0 whole mesh hidden, 1 headless body
@@ -31,7 +34,7 @@ struct MenuSettings {
 
     // Centimetres the eye is raised while airborne. On the page because it is judged by eye,
     // in a headset, mid-jump - which is not something a number in a file can be tuned by.
-    float air_lift{36.0f};
+    float air_lift{40.0f};
     // Pushed forward while airborne as well: the tuck brings the chest up AND
     // forward, and height alone does not always clear it.
     float air_forward{0.0f};
