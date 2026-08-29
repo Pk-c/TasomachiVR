@@ -36,11 +36,6 @@ struct MenuSettings {
     // forward, and height alone does not always clear it.
     float air_forward{0.0f};
 
-    // Seconds the head stays hidden after landing. On the page because the right value is
-    // whatever stops it flashing back while the recovery animation is still unwinding, and
-    // that is only visible from inside the headset.
-    float head_hide_linger{0.30f};
-
     // Rendering, driven live through console commands rather than the game's ini - so both
     // are judged in the headset and neither needs a restart.
     //

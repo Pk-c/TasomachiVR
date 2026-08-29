@@ -72,6 +72,78 @@ float normalize_deg(float deg) {
     return deg;
 }
 
+// Distance from a point to the closest point on a line segment. The character's Head bone
+// sits near the base of the skull, so a sphere around that one point does not cover the face,
+// hair and crown. The segment from Head to HeadTop_End is the centre line of a much better
+// approximation: a capsule that follows the animated head without needing mesh collision.
+uc::Vec3 closest_point_on_segment(const uc::Vec3& point, const uc::Vec3& start,
+                                  const uc::Vec3& end) {
+    const float sx = end.x - start.x;
+    const float sy = end.y - start.y;
+    const float sz = end.z - start.z;
+    const float length_sq = sx * sx + sy * sy + sz * sz;
+
+    float t = 0.0f;
+    if (length_sq > 0.0001f) {
+        t = ((point.x - start.x) * sx + (point.y - start.y) * sy +
+             (point.z - start.z) * sz) /
+            length_sq;
+        t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+    }
+
+    return uc::Vec3{start.x + sx * t, start.y + sy * t, start.z + sz * t};
+}
+
+float point_segment_distance(const uc::Vec3& point, const uc::Vec3& start,
+                             const uc::Vec3& end) {
+    const auto closest = closest_point_on_segment(point, start, end);
+    const float dx = point.x - closest.x;
+    const float dy = point.y - closest.y;
+    const float dz = point.z - closest.z;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+// A small sphere against a view cone. The sphere radius expands the cone, so geometry can
+// enter the edge of the view before its bone centre does. `forward` is a unit world-space
+// direction. A cone is used rather than one eye's asymmetric projection because the relevant
+// VR frustum is the union of both eyes.
+bool sphere_intersects_view_cone(const uc::Vec3& centre, float radius,
+                                 const uc::Vec3& camera, const uc::Vec3& forward,
+                                 float half_angle_degrees) {
+    const float dx = centre.x - camera.x;
+    const float dy = centre.y - camera.y;
+    const float dz = centre.z - camera.z;
+    const float along = dx * forward.x + dy * forward.y + dz * forward.z;
+    if (along + radius <= 0.0f) {
+        return false; // the whole sphere is behind the view plane
+    }
+
+    const float distance_sq = dx * dx + dy * dy + dz * dz;
+    const float perpendicular_sq =
+        distance_sq > along * along ? distance_sq - along * along : 0.0f;
+    const float cone_radius =
+        (along > 0.0f ? along : 0.0f) * std::tan(half_angle_degrees * kDegToRad) + radius;
+    return perpendicular_sq <= cone_radius * cone_radius;
+}
+
+bool capsule_intersects_view_cone(const uc::Vec3& start, const uc::Vec3& end, float radius,
+                                  const uc::Vec3& camera, const uc::Vec3& forward,
+                                  float half_angle_degrees) {
+    // Five centres are ample for a segment this short, and include both ends. Sampling avoids
+    // assuming that the closest point to the camera is also the closest point to the cone.
+    for (int i = 0; i <= 4; ++i) {
+        const float t = static_cast<float>(i) * 0.25f;
+        const uc::Vec3 centre{start.x + (end.x - start.x) * t,
+                              start.y + (end.y - start.y) * t,
+                              start.z + (end.z - start.z) * t};
+        if (sphere_intersects_view_cone(centre, radius, camera, forward,
+                                        half_angle_degrees)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 struct Config {
     // OpenXR is right-handed with +Y up; UE is left-handed with +Z up, so a head turn
     // maps to the opposite sign of yaw. Measured on Europa, same convention here.
@@ -173,9 +245,6 @@ struct Config {
     // What the player sees of themselves. 0 = whole mesh hidden, 1 = body visible with
     // the head bone collapsed. See body.hpp for what each costs.
     int   body_mode      = 1;
-    bool  head_hide_air_only = true;
-    // Seconds the head stays hidden after landing, so it does not reappear mid-recovery.
-    float head_hide_linger = 0.30f;
 
     // The eye follows the head bone, filtered. See eye.hpp for why the filter needs a
     // hard clamp as well as a low-pass.
@@ -598,16 +667,9 @@ public:
             API::VR::set_mod_value("UI_Distance", m_config.menu_distance);
         }
 
-        // THE HEAD COMES BACK when the view is no longer inside it.
-        //
-        // The head is hidden for one reason only: at head height you would be looking at the
-        // inside of her skull. Step away from it - roomscale, a lean, anything that moves the
-        // view - and that reason disappears, leaving a headless character in plain sight.
-        //
-        // Hysteresis on the distance, because the two states differ by a full re-application
-        // of the body and flickering between them would be worse than either.
-        // MovementMode is a TEnumAsByte - a whole byte, not a bitfield, so reading it is
-        // safe. EMovementMode: 1 = Walking, 3 = Falling.
+        // Airborne state now drives only the two eye offsets below; it has no say in head
+        // visibility. MovementMode is a TEnumAsByte - a whole byte, not a bitfield, so
+        // reading it is safe. EMovementMode: 1 = Walking, 3 = Falling.
         bool airborne = false;
         if (m_cmc != nullptr) {
             if (auto* mode = m_cmc->get_property_data<uint8_t>(L"MovementMode")) {
@@ -615,44 +677,18 @@ public:
             }
         }
 
-        // HELD OVER THE LANDING. Re-armed for as long as she is off the ground, then it
-        // runs down - so the head stays away until the recovery animation has played out and
-        // does not flash back the instant her feet touch, which is the moment the tuck is
-        // still unwinding through the camera.
-        {
-            const float dt = delta > 0.0f ? delta : 0.016f;
-            if (airborne) {
-                m_air_linger = m_config.head_hide_linger;
-            } else if (m_air_linger > 0.0f) {
-                m_air_linger -= dt;
-            }
-        }
-
         int body_mode = menu_visible ? 0 : m_config.body_mode;
 
-        // THE HEAD IS ONLY IN THE WAY WHILE AIRBORNE, so that is the only time it is hidden.
+        // CLOSE AND IN VIEW HIDES; BEHIND THE CAMERA OR FAR AWAY REVEALS.
         //
-        // On the ground the head bone sits behind the eye and never intrudes - which is why
-        // the jump needed EyeAirLift and EyeAirForward in the first place: the tuck brings the
-        // chest and the head up and forward, into the camera.
-        //
-        // The point of this is the SHADOW. A hidden bone casts no shadow either, and no
-        // arrangement of meshes can separate the two - that was measured three ways. Hiding
-        // the head only during a jump means the shadow is whole for as long as you are
-        // standing on the ground looking at it, and headless only while you are in the air and
-        // not looking. It does not solve the problem; it moves it to where it does not show.
-        if (body_mode == 1 && m_config.head_hide_air_only && !airborne &&
-            m_air_linger <= 0.0f) {
-            body_mode = 2;   // Body::Whole
-        }
-
-        // NEAR HIDES, FAR REVEALS - and it now decides in both directions.
-        //
-        // It used to run only when the mode was already Headless, so it could reveal a hidden
-        // head but never hide a shown one. With the head shown by default on the ground, and
-        // on the ship where there is no jump to key off, that left nothing to hide it when you
-        // lean into the character. The rule owns the choice now: close means hidden, far means
-        // whole, with the same hysteresis band as before.
+        // A sphere around Head was too small in the wrong place: that bone is at the base of
+        // the skull, so the camera could be inside the face, hair or crown while being outside
+        // the sphere. Head -> HeadTop_End gives the animated centre line of the whole head.
+        // The distance to that segment supplies the close-range gate. The same animated
+        // capsule is tested against the headset's forward view cone, so standing in front of
+        // the character leaves her head intact behind the camera; a jump only hides it when
+        // the animation actually carries it into view. If the top bone is unavailable, the
+        // old sphere remains as a fallback. Distance and angle both have hysteresis.
         if ((body_mode == 1 || body_mode == 2) && m_cam_known.load() &&
             m_config.head_reveal > 0.0f) {
             auto* mesh = deref_object(m_pawn, L"Mesh");
@@ -661,16 +697,37 @@ public:
             }
             uc::Vec3 head{};
             if (mesh != nullptr && uc::socket_location(mesh, L"Head", head)) {
-                const float dx = m_cam[0].load() - head.x;
-                const float dy = m_cam[1].load() - head.y;
-                const float dz = m_cam[2].load() - head.z;
-                const float away = std::sqrt(dx * dx + dy * dy + dz * dz);
+                const uc::Vec3 camera{m_cam[0].load(), m_cam[1].load(), m_cam[2].load()};
+                uc::Vec3 head_top{};
+                const bool have_top = uc::socket_location(mesh, L"HeadTop_End", head_top);
+                const float away = have_top ? point_segment_distance(camera, head, head_top)
+                                            : point_segment_distance(camera, head, head);
                 const float on = m_config.head_reveal;
                 const float off = on * 0.7f;   // the hysteresis band
-                if (away > on) {
+                const bool was_shown = m_head_shown;
+                const uc::Vec3 capsule_end = have_top ? head_top : head;
+                const uc::Vec3 view_forward{m_cam_forward[0].load(),
+                                            m_cam_forward[1].load(),
+                                            m_cam_forward[2].load()};
+                // Narrower to hide, wider to remain hidden: the angular equivalent of the
+                // distance hysteresis, preventing edge-of-view animation from flickering.
+                const bool in_hide_view = m_cam_forward_known.load() &&
+                    capsule_intersects_view_cone(head, capsule_end, off, camera,
+                                                 view_forward, 55.0f);
+                const bool in_hold_view = m_cam_forward_known.load() &&
+                    capsule_intersects_view_cone(head, capsule_end, off, camera,
+                                                 view_forward, 65.0f);
+                if (away > on || !in_hold_view) {
                     m_head_shown = true;
-                } else if (away < off) {
+                } else if (away < off && in_hide_view) {
                     m_head_shown = false;
+                }
+                if (m_head_shown != was_shown) {
+                    API::get()->log_info("[TasomachiVR] HEAD | %s at %.1f cm from head %s "
+                                         "(in_view=%d, hide < %.1f, reveal > %.1f)",
+                                         m_head_shown ? "shown" : "hidden", away,
+                                         have_top ? "capsule" : "bone", (int)in_hide_view,
+                                         off, on);
                 }
                 body_mode = m_head_shown ? 2 : 1;
             }
@@ -1132,7 +1189,6 @@ private:
         s.hud_always_on  = m_config.hud_always_on;
         s.air_lift       = m_config.eye_air_lift;
         s.air_forward    = m_config.eye_air_forward;
-        s.head_hide_linger = m_config.head_hide_linger;
         s.detail         = m_config.detail;
         s.supersample    = m_config.supersample;
 
@@ -1151,7 +1207,6 @@ private:
         m_config.hud_always_on  = s.hud_always_on;
         m_config.eye_air_lift   = s.air_lift;
         m_config.eye_air_forward = s.air_forward;
-        m_config.head_hide_linger = s.head_hide_linger;
         m_config.detail          = s.detail;
         m_config.supersample     = s.supersample;
 
@@ -2352,28 +2407,53 @@ private:
     // Everything downstream - the body's facing, the direction she walks, the interface
     // logic - is derived from this one number, so folding it in here fixes all of them at
     // once and makes recentring a coherent operation instead of a desynchronising one.
-    float hmd_quat_yaw() {
+    bool hmd_quaternion(UEVR_Quaternionf& q) {
         const auto* vr = API::get()->param()->vr;
         if (vr == nullptr) {
-            return 0.0f;
+            return false;
         }
 
         UEVR_Vector3f pos{};
-        UEVR_Quaternionf q{};
         vr->get_pose(vr->get_hmd_index(), &pos, &q);
 
         if (m_config.apply_rotation_offset) {
             const auto offset = API::VR::get_rotation_offset();
             q = quat_mul(offset, q);
         }
+        return true;
+    }
+
+    float hmd_quat_yaw() {
+        UEVR_Quaternionf q{};
+        if (!hmd_quaternion(q)) {
+            return 0.0f;
+        }
         return quat_yaw(q);
     }
 
     void update_final_yaw() {
-        m_quat_yaw.store(hmd_quat_yaw());
+        UEVR_Quaternionf q{};
+        const bool have_pose = hmd_quaternion(q);
+        m_quat_yaw.store(have_pose ? quat_yaw(q) : 0.0f);
         const float head = m_quat_yaw.load() * m_config.yaw_sign + m_snap_yaw.load()
                            + m_anchor_trim.load();
         m_final_yaw.store(normalize_deg(head + m_config.yaw_offset));
+
+        if (have_pose) {
+            // Vertical component of the OpenXR forward vector (local 0,0,-1). Horizontal
+            // heading uses the already validated yaw path above; combining them gives the
+            // full world-space direction without trusting the stereo callback rotation,
+            // which does not include the headset pose.
+            float up = 2.0f * (q.w * q.x - q.y * q.z);
+            up = up < -1.0f ? -1.0f : (up > 1.0f ? 1.0f : up);
+            const float horizontal = std::sqrt(1.0f - up * up);
+            const float view_yaw =
+                normalize_deg(m_final_yaw.load() - m_config.yaw_offset) * kDegToRad;
+            m_cam_forward[0].store(std::cos(view_yaw) * horizontal);
+            m_cam_forward[1].store(std::sin(view_yaw) * horizontal);
+            m_cam_forward[2].store(up);
+            m_cam_forward_known.store(true);
+        }
     }
 
     // Makes the body behave like an FPS: face where the player is looking, and strafe
@@ -2500,7 +2580,6 @@ private:
             {"HudAlwaysOn",     std::to_string(m_config.hud_always_on ? 1 : 0)},
             {"EyeAirLift",      format_number(m_config.eye_air_lift)},
             {"EyeAirForward",   format_number(m_config.eye_air_forward)},
-            {"HeadHideLinger",  format_number(m_config.head_hide_linger)},
             {"Detail",          format_number(m_config.detail)},
             {"Supersample",     format_number(m_config.supersample)},
         };
@@ -2698,10 +2777,6 @@ private:
             else if (key == "GraftPauseMenu")
                 m_config.graft_pause_menu = std::atoi(value.c_str()) != 0;
             else if (key == "BodyMode")      m_config.body_mode = std::atoi(value.c_str());
-            else if (key == "HeadHideAirOnly")
-                m_config.head_hide_air_only = std::atoi(value.c_str()) != 0;
-            else if (key == "HeadHideLinger")
-                m_config.head_hide_linger = (float)std::atof(value.c_str());
             else if (key == "SwapSticks")    m_config.swap_sticks = std::atoi(value.c_str()) != 0;
             else if (key == "InteractButton") m_config.interact_button = std::atoi(value.c_str());
             else if (key == "HudCounters")   m_config.hud_counters = value;
@@ -2764,6 +2839,8 @@ private:
     // Cancels the anchor rotation for the view and the body, and for nothing else.
     std::atomic<float> m_cam[3]{};
     std::atomic<bool> m_cam_known{false};
+    std::atomic<float> m_cam_forward[3]{};
+    std::atomic<bool> m_cam_forward_known{false};
     // A remap source is either a VR action (a face button, whose physical bit is the
     // runtime's business) or an XInput bit of its own - which is what the grips are, since
     // they reach us already translated to the shoulder buttons.
@@ -2812,7 +2889,6 @@ private:
     float m_detail_applied{-1.0f};
     float m_supersample_applied{-1.0f};
     std::atomic<float> m_air_blend{0.0f};
-    float m_air_linger{0.0f};
     std::atomic<float> m_anchor_trim{0.0f};
     std::atomic<float> m_final_yaw{0.0f};
     // The yaw actually written to the pawn, held still while the headset only jitters.

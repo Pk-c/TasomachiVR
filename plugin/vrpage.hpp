@@ -79,7 +79,6 @@ private:
         HudAlways,
         AirLift,
         AirForward,
-        HeadLinger,
         Detail,
         Supersample,
         RowCount,
