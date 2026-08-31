@@ -1,0 +1,65 @@
+TasomachiVR - first person VR for Tasomachi: Behind the Twilight
+================================================================
+
+Requires the Steam version of the game and a PC VR headset.
+
+
+INSTALL
+-------
+
+1. Open the game's folder. In Steam: right-click Tasomachi ->
+   Manage -> Browse local files, then go into
+
+       tasomachi\Binaries\Win64
+
+   You should see tasomachi-Win64-Shipping.exe there.
+
+2. Unzip everything from this archive into that folder. Afterwards it
+   contains:
+
+       tasomachi-Win64-Shipping.exe     (the game, already there)
+       dsound.dll                       (new)
+       Uninstall.bat                    (new)
+       TasomachiVR\                     (new)
+
+3. Launch the game from Steam as usual, with the headset connected.
+
+There is no installer and nothing to configure. The first launch sets up
+the rest by itself - it places the VR profile where UEVR expects it and
+adjusts one audio setting so the game keeps playing while the headset has
+focus.
+
+
+IN GAME
+-------
+
+Open the pause menu and choose VR SETTINGS. Everything is adjustable from
+inside the headset: eye position, turning, the interface, and the graphics.
+Changes take effect immediately and are saved when you leave the page.
+
+All the same settings live in TasomachiVR\TasomachiVR.ini, each with a
+comment explaining what it does and why it is set the way it is. Editing
+that file is only needed for the handful of things the page does not show.
+
+
+UNINSTALL
+---------
+
+Double-click Uninstall.bat, in the same folder.
+
+It removes the loader, the mod folder, the VR profile it created in your
+user folder, and the audio line it added to the game's own configuration.
+Deleting the files by hand would leave those last two behind, which is why
+the uninstaller exists rather than a note telling you which files to drop.
+
+Your save games are untouched - the mod never writes to them.
+
+
+IF SOMETHING GOES WRONG
+-----------------------
+
+TasomachiVR\TasomachiVR.log records what the loader did on the last launch.
+It is plain text and starts with the version and the paths it resolved,
+which is usually enough to see what went wrong.
+
+The game still runs flat if you launch it without a headset connected.

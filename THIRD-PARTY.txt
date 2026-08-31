@@ -1,0 +1,36 @@
+TasomachiVR - third party components
+====================================
+
+This mod ships binaries it did not build. They are redistributed unmodified.
+
+
+UEVR - praydog
+--------------
+    UEVRBackend.dll
+    UEVRPluginNullifier.dll
+
+The universal Unreal Engine VR injector that TasomachiVR is a plugin for. It
+does the work this mod does not: stereo rendering, headset and controller
+tracking, and the reflection interface the plugin uses to reach the game.
+
+    https://github.com/praydog/UEVR                     MIT
+
+
+OpenXR loader - The Khronos Group
+---------------------------------
+    openxr_loader.dll
+
+    https://github.com/KhronosGroup/OpenXR-SDK          Apache 2.0
+
+
+OpenVR - Valve Corporation
+--------------------------
+    openvr_api.dll
+
+    https://github.com/ValveSoftware/openvr             BSD 3-Clause
+
+
+Tasomachi: Behind the Twilight is the property of its authors. This mod
+contains none of the game's own files: it reads the game as it runs and
+changes nothing on disk beyond its own folder and the two settings the
+uninstaller puts back.
