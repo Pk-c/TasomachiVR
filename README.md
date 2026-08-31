@@ -37,6 +37,20 @@ Youtube Demo
 [![Demo](https://img.youtube.com/vi/NTxkmfaO3Qc/maxresdefault.jpg)](https://youtu.be/NTxkmfaO3Qc)
 
 
+## Install
+
+Download the archive from [Releases](../../releases) and unzip its contents into
+
+```
+tasomachi\Binaries\Win64
+```
+
+That's all
+
+**Uninstall** by double-clicking `Uninstall.bat`, next to `dsound.dll`. It removes the loader,
+the mod folder, the VR profile it created and the audio line it added. Deleting the files by
+hand would leave the last two behind. Save games are never touched.
+
 ## Controls
 
 **On Foot**
@@ -72,20 +86,6 @@ Bindings are for Touch-style controllers. Everything here is remappable in
 `TasomachiVR\TasomachiVR.ini` — the entries are `ButtonEvent`, `ButtonRemap`,
 `InteractButton`, `PauseButton` and `HudRevealSource`, each with a comment explaining what
 it reaches and why.
-
-## Install
-
-Download the archive from [Releases](../../releases) and unzip its contents into
-
-```
-tasomachi\Binaries\Win64
-```
-
-That's all
-
-**Uninstall** by double-clicking `Uninstall.bat`, next to `dsound.dll`. It removes the loader,
-the mod folder, the VR profile it created and the audio line it added. Deleting the files by
-hand would leave the last two behind. Save games are never touched.
 
 ## Known issues
 
