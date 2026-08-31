@@ -1,5 +1,7 @@
 # TasomachiVR
 
+<img width="1672" height="941" alt="tasoVR" src="https://github.com/user-attachments/assets/acfbcbdc-9d85-45c9-acba-33384a364362" />
+
 A first-person VR mod for **[Tasomachi](https://store.steampowered.com/app/1015890/TASOMACHI_Behind_the_Twilight/)** (
 Orbital Express), built on praydog's [UEVR](https://github.com/praydog/UEVR).
 
@@ -30,6 +32,9 @@ OR
 Everything adjustable from inside the headset lives on the VR page. The rest lives in
 `TasomachiVR\TasomachiVR.ini`, where every setting carries a comment explaining what it does
 and why it holds the value it does.
+
+Youtube Demo
+[![Demo](https://img.youtube.com/vi/NTxkmfaO3Qc/maxresdefault.jpg)](https://youtu.be/NTxkmfaO3Qc)
 
 
 ## Controls
